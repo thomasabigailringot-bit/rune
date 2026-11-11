@@ -124,12 +124,6 @@ impl<S: 'static> Live<S> {
         took || ev.key == Key::Left
     }
 
-    /// Notes whether the keyboard is on the open story's side controls, which their view
-    /// shows; true when that changed.
-    pub(crate) fn set_side_active(&mut self, active: bool) -> bool {
-        std::mem::replace(&mut self.side_active, active) != active
-    }
-
     /// What the open story's trigger on `c` asks for, as its letter does: R replays.
     pub(super) fn trigger_request(&self, c: char) -> Option<Request> {
         self.triggers().iter().any(|(k, _)| *k == c).then_some(if c == 'r' { Request::Replay } else { Request::Trigger(c) })
