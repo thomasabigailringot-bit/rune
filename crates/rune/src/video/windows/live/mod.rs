@@ -18,6 +18,7 @@ use crate::native_surface::windows::DecodedPlanes;
 use crate::time::Instant;
 use crate::video::Meta;
 use crate::video::live::{AacFrame, AccessUnit, LiveInput, Pushed};
+use crate::video::steer;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -136,13 +137,14 @@ impl Live {
                 self.backlog.clear();
                 self.restart(pipe);
             }
+            // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
+            // (`target_delay`) waits here as access units, which cost far less than pictures.
+            self.backlog.extend(queues.video);
+            self.bound_backlog(pipe);
             // Sound first: the first picture's facts say whether there is sound to play.
             for frame in queues.audio {
                 self.sound_frame(frame, sound.is_some());
             }
-            // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
-            // (`target_delay`) waits here as access units, which cost far less than pictures.
-            self.backlog.extend(queues.video);
             if let Some(to) = skip {
                 self.skip(to, pipe);
             }
@@ -159,6 +161,40 @@ impl Live {
                 (job.notify)();
                 return Ok(());
             }
+        }
+    }
+
+    /// Nobody takes the pictures (the window is covered, say) while the stream goes on: more than
+    /// `steer::backlog_limit` of video waiting is cut to the keyframe that keeps the target, and
+    /// the sound before it goes too. The clock then rejoins by the jump path, with nothing stale
+    /// to show on the way.
+    fn bound_backlog(&mut self, pipe: &Pipe) {
+        let target = self.input.target_seconds();
+        let units = self
+            .backlog
+            .iter()
+            .map(|u| (u.item.pts as f64 / 90_000.0, u.item.keyframe));
+        let Some(cut) = steer::backlog_cut(units, target) else { return };
+        if let Some(first) = self.backlog.front() {
+            self.seconds(first.item.pts);
+        }
+        let floor = self.seconds((cut.floor * 90_000.0) as i64);
+        self.backlog.drain(..cut.drop);
+        self.video.flush();
+        self.pending.clear();
+        self.skip_until = Some(floor);
+        let mut lost = cut.drop as u64;
+        {
+            let mut s = pipe.lock();
+            let before = s.frames.len();
+            s.frames.retain(|frame| frame.pts >= floor);
+            lost += (before - s.frames.len()) as u64;
+        }
+        if let Some(output) = &self.output {
+            output.trim(floor, steer::backlog_limit(target));
+        }
+        if pipe.late.fetch_add(lost, Ordering::Relaxed) == 0 && logging() {
+            log!("live: {lost} pictures dropped, more than {:.1} s of video was waiting", steer::backlog_limit(target));
         }
     }
 
@@ -260,7 +296,8 @@ impl Live {
             };
             self.sound_next = at + (values.len() / channels) as f64 / rate;
             if let Some(output) = &self.output {
-                output.push_pcm(values, at, f64::NEG_INFINITY);
+                output.push_pcm(values, at, self.skip_until.unwrap_or(f64::NEG_INFINITY));
+                output.trim(f64::NEG_INFINITY, steer::backlog_limit(self.input.target_seconds()));
             }
         }
     }

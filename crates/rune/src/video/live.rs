@@ -113,6 +113,11 @@ impl LiveInput {
         (t != i64::MIN && origin != i64::MIN).then(|| (t - origin) as f64 / 90_000.0)
     }
 
+    /// The delay the clock aims at, in seconds.
+    pub(crate) fn target_seconds(&self) -> f64 {
+        self.config.target_delay.as_secs_f64()
+    }
+
     /// The decoder's time zero, in ticks (None: not set yet).
     pub(crate) fn set_origin(&self, ticks: Option<i64>) {
         self.origin

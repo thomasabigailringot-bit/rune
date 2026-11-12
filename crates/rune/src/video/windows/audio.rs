@@ -159,6 +159,24 @@ impl Output {
         feed.chunks.push_back(Chunk { pts, samples });
     }
 
+    /// Bounds the queued sound of a live video: forgets what ends before `keep_from` (media
+    /// seconds), then the oldest beyond `max` seconds.
+    pub(super) fn trim(&self, keep_from: f64, max: f64) {
+        let channels = usize::from(self.sound.channels);
+        let rate = f64::from(self.sound.rate);
+        let per_second = rate * channels as f64;
+        let mut feed = self.feed.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(front) = feed.chunks.front() {
+            let ends = front.pts + (front.samples.len() / channels) as f64 / rate;
+            if ends > keep_from && feed.samples as f64 <= max * per_second {
+                break;
+            }
+            let Some(chunk) = feed.chunks.pop_front() else { break };
+            feed.samples -= chunk.samples.len();
+            feed.cursor = None;
+        }
+    }
+
     /// Forgets queued sound (a seek).
     pub(super) fn flush(&self) {
         let mut feed = self.feed.lock().unwrap();
