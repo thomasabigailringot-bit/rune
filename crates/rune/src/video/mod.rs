@@ -185,6 +185,29 @@ impl MediaRequest {
     }
 }
 
+/// What [`Player::stats`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct PlayerStats {
+    /// Pictures put on the surface.
+    pub shown: u64,
+    /// Pictures that were due and skipped because a later one was due too: the display drew
+    /// fewer frames than the clip has.
+    pub dropped: u64,
+    /// Times playback held with no picture decoded in time.
+    pub stalls: u64,
+    /// Sound device fills that had no decoded sound to write (silence played).
+    pub sound_gaps: u64,
+    /// Frames of silence those gaps wrote.
+    pub sound_silent_frames: u64,
+    /// Frames written to the sound device in all while the clock ran.
+    pub sound_frames: u64,
+    /// Whether pictures come out of a hardware decoder. None until the first picture decoded.
+    pub hardware: Option<bool>,
+    /// Pictures decoded and waiting for their time.
+    pub queued: usize,
+}
+
 /// Playback state. Video reports it as of the last frame that drew it; audio as of its last
 /// tick or edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +312,18 @@ impl Player {
 
     pub fn source(&self) -> &MediaSource {
         &self.shared.source
+    }
+    /// Counters since the player opened: pictures shown and skipped, stalls, sound gaps.
+    /// Windows only; elsewhere all zero.
+    pub fn stats(&self) -> PlayerStats {
+        backend::stats(&self.shared)
+    }
+    /// Calls `observer` on the UI thread for each picture that reaches the surface, with the
+    /// picture's clip time in seconds and the instant its display refresh presents it, so an app
+    /// can measure latency and pacing against its own clock. Windows only; elsewhere it is never
+    /// called.
+    pub fn set_picture_observer(&self, observer: impl Fn(f64, Instant) + Send + Sync + 'static) {
+        backend::set_observer(&self.shared, Arc::new(observer));
     }
     /// Whether this is an audio-only player from [`Player::audio`].
     pub fn is_audio(&self) -> bool {

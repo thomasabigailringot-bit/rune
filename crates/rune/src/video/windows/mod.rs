@@ -23,6 +23,7 @@ mod vsync;
 use super::*;
 use decoder::{Decoded, Facts, Job, News, Pic, Pipe};
 use machine::{Effect, Event, Phase};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// A muted clip undrawn this long picks up at its picture when drawn again, rather than
@@ -51,6 +52,17 @@ pub(crate) struct Native {
     /// When the decoder was last started, until its first picture reached the surface
     /// (`RUNE_VIDEO_LOG`).
     opened: Option<Instant>,
+    counts: Counts,
+    /// Told of each picture that reaches the surface (`Player::set_picture_observer`).
+    observer: Option<Arc<dyn Fn(f64, Instant) + Send + Sync>>,
+}
+
+/// What `Player::stats` reports, kept on the UI thread.
+#[derive(Default)]
+struct Counts {
+    shown: u64,
+    dropped: u64,
+    stalls: u64,
 }
 
 // The reader in `still` stays on the headless thread that made it, under the Shared mutex.
@@ -144,6 +156,28 @@ pub(super) fn preload(shared: &Arc<Shared>) {
         let play = c.playing();
         native.event(shared, &c, Event::Open { play });
     }
+}
+
+pub(super) fn stats(shared: &Shared) -> PlayerStats {
+    let native = shared.native.lock().unwrap();
+    let (silent, played) = native.clock.silence();
+    PlayerStats {
+        shown: native.counts.shown,
+        dropped: native.counts.dropped,
+        stalls: native.counts.stalls,
+        sound_gaps: native.clock.gaps(),
+        sound_silent_frames: silent,
+        sound_frames: played,
+        hardware: native.pipe.as_ref().and_then(|p| match p.hardware.load(Ordering::Relaxed) {
+            0 => None,
+            h => Some(h == 2),
+        }),
+        queued: native.pipe.as_ref().map_or(0, |p| p.lock().frames.len()),
+    }
+}
+
+pub(super) fn set_observer(shared: &Shared, observer: Arc<dyn Fn(f64, Instant) + Send + Sync>) {
+    shared.native.lock().unwrap().observer = Some(observer);
 }
 
 /// Audio: where the clock has it now. The clock runs only while the sound does, so it's always
@@ -342,8 +376,13 @@ impl Native {
                 Phase::Paused { .. } if self.shown.is_none() => inbox.frames.pop_front(),
                 Phase::Playing { clock } => {
                     let pos = clock.position(target);
-                    let mut newest = None;
+                    let mut newest: Option<Decoded> = None;
                     while inbox.frames.front().is_some_and(|f| f.pts <= pos) {
+                        // A picture passed over for a later one was due and never shown: the
+                        // display drew fewer frames than the clip has.
+                        if newest.is_some() {
+                            self.counts.dropped += 1;
+                        }
                         newest = inbox.frames.pop_front();
                     }
                     newest
@@ -358,6 +397,10 @@ impl Native {
         pipe.poke();
         let pts = frame.pts;
         self.put(c, surface, frame);
+        self.counts.shown += 1;
+        if let Some(observer) = &self.observer {
+            observer(pts, target);
+        }
         if let Phase::Buffering { .. } = self.phase {
             self.event(shared, c, Event::Shown { pts, target, lead, rate: f64::from(c.rate) });
         }
@@ -383,6 +426,7 @@ impl Native {
                 self.end(shared, c, shown, duration);
             }
         } else if pos > shown + frame * 2.0 + 0.1 {
+            self.counts.stalls += 1;
             self.event(shared, c, Event::Stalled { at: shown + frame });
         }
     }

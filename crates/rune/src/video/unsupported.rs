@@ -43,3 +43,9 @@ pub(super) fn pull(_: &Arc<Shared>, _: &NativeSurface, _: Instant) -> bool {
 pub(super) fn due(_: &Shared) -> Option<Instant> {
     None
 }
+
+pub(super) fn stats(_: &Shared) -> PlayerStats {
+    PlayerStats::default()
+}
+
+pub(super) fn set_observer(_: &Shared, _: Arc<dyn Fn(f64, Instant) + Send + Sync>) {}

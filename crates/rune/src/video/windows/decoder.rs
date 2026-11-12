@@ -14,6 +14,7 @@ use crate::native_surface::ByteFrame;
 use crate::native_surface::windows::DecodedPlanes;
 use crate::time::Instant;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_DECODER, ID3D11Texture2D};
@@ -79,6 +80,8 @@ pub(super) enum Pic {
 
 pub(super) struct Pipe {
     inbox: Mutex<Inbox>,
+    /// What the first decoded picture showed: 0 unknown, 1 software, 2 hardware.
+    pub hardware: AtomicU8,
     wake: Condvar,
 }
 
@@ -113,6 +116,7 @@ pub(super) struct Job {
 pub(super) fn start(job: Job) -> Arc<Pipe> {
     let pipe = Arc::new(Pipe {
         inbox: Mutex::new(Inbox { looping: job.looping, sound: job.sound, touched: Some(Instant::now()), ..Inbox::default() }),
+        hardware: AtomicU8::new(0),
         wake: Condvar::new(),
     });
     let thread_pipe = pipe.clone();
@@ -346,6 +350,7 @@ impl Decoder {
                 if video {
                     if read.time + self.facts.meta.frame * 0.5 >= skip_before {
                         let picture = self.picture(sample)?;
+                        pipe.hardware.store(if self.facts.hardware { 2 } else { 1 }, Ordering::Relaxed);
                         let mut s = pipe.lock();
                         let was_empty = s.frames.is_empty();
                         s.frames.push_back(Decoded { generation, pts: epoch + read.time, picture });

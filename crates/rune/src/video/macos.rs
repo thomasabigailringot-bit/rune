@@ -837,3 +837,9 @@ pub(super) fn parked_with(shared: &Arc<Shared>) -> Vec<Arc<Shared>> {
     let excess = parked.len().saturating_sub(PARKED_PLAYERS);
     parked.drain(..excess).filter_map(|w| w.upgrade()).collect()
 }
+
+pub(super) fn stats(_: &Shared) -> PlayerStats {
+    PlayerStats::default()
+}
+
+pub(super) fn set_observer(_: &Shared, _: Arc<dyn Fn(f64, Instant) + Send + Sync>) {}
