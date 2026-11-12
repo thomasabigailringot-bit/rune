@@ -47,6 +47,8 @@ pub(super) struct Inbox {
     pub frames: VecDeque<Decoded>,
     /// The generation whose last picture is in the queue: the clip ended there.
     pub ended: Option<u32>,
+    /// A fed recording: the run whose media the decoder took in to the end.
+    pub run_ended: Option<u64>,
     /// Live: the stream's timeline jumped; the clock starts again at the next picture.
     pub jump: bool,
 }
@@ -76,6 +78,8 @@ pub(super) struct Decoded {
     pub generation: u32,
     /// Seconds from the clip's start, counting on through loops.
     pub pts: f64,
+    /// A fed recording: the number of the run the picture belongs to (0 for anything else).
+    pub run: u64,
     pub picture: Pic,
     /// Live: when the access unit this picture decodes from was pushed.
     pub pushed: Option<Instant>,
@@ -374,7 +378,7 @@ impl Decoder {
                         pipe.hardware.store(if self.facts.hardware { 2 } else { 1 }, Ordering::Relaxed);
                         let mut s = pipe.lock();
                         let was_empty = s.frames.is_empty();
-                        s.frames.push_back(Decoded { generation, pts: epoch + read.time, picture, pushed: None });
+                        s.frames.push_back(Decoded { generation, pts: epoch + read.time, run: 0, picture, pushed: None });
                         drop(s);
                         if first {
                             crate::marks::mark("video.first_frame");

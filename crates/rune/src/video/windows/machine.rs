@@ -197,7 +197,7 @@ pub(super) fn step(phase: &mut Phase, event: Event) -> Effects<Effect> {
             *phase = P::Buffering { at, play: true };
             Effects::one(Effect::Clock(None))
         }
-        (P::Playing { .. }, Event::Ended { at }) => {
+        (P::Playing { .. } | P::Buffering { .. }, Event::Ended { at }) => {
             *phase = P::Ended { at };
             Effects::one(Effect::Clock(None))
         }

@@ -12,8 +12,10 @@
 //! before the clock, and decoding restarts there when a frame draws again.
 //!
 //! A recording (`LiveConfig::on_demand`) is not steered: the UI owns its clock (it starts at the
-//! first picture shown and pause stops it), nothing is cut or rested, the units wait as long as
-//! the app keeps them queued, and the thread outlives the end of the stream so that a restart can
+//! first picture shown and pause stops it) and nothing is cut. Behind a covered or minimized window
+//! the clock goes on, and with it the sound and `Player::time`: no picture is decoded (`rest`) and
+//! the units wait from the last keyframe before the clock, as many as the app keeps queued (it
+//! reads as the clock advances). The thread outlives the end of the stream so that a restart can
 //! play it again.
 
 mod aac;
@@ -95,6 +97,8 @@ struct Live {
     backlog: VecDeque<Pushed<AccessUnit>>,
     /// After a jump: pictures before this time (seconds) are decoded but not kept.
     skip_until: Option<f64>,
+    /// A recording: the number of the run the pictures come from.
+    run: u64,
     /// The sound output failed to open (logged once).
     sound_failed: bool,
     /// Where the next sound block starts, if the transform stamps none.
@@ -131,6 +135,7 @@ impl Live {
             );
         }
         job.clock.set_varispeed(true);
+        let run = input.restarted().unwrap_or(0);
         Ok(Self {
             on_demand: input.config.on_demand,
             // A recording's stamps are its media time: seconds start at 0 (see `LiveInput`).
@@ -147,6 +152,7 @@ impl Live {
             pending: VecDeque::new(),
             backlog: VecDeque::new(),
             skip_until: None,
+            run,
             sound_failed: false,
             sound_next: 0.0,
             clock: job.clock.clone(),
@@ -173,7 +179,10 @@ impl Live {
                 self.backlog.clear();
                 self.restart(pipe);
                 // A recording's new run decodes from its keyframe and shows from where it was asked.
-                self.skip_until = queues.restart_at;
+                if let Some((at, run)) = queues.restart {
+                    self.skip_until = Some(at);
+                    self.run = run;
+                }
             }
             // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
             // (`target_delay`) waits here as access units, which cost far less than pictures.
@@ -205,6 +214,7 @@ impl Live {
                 let mut s = pipe.lock();
                 let told = s.ended == Some(generation);
                 s.ended = Some(generation);
+                s.run_ended = Some(self.run);
                 drop(s);
                 if !self.on_demand {
                     (job.notify)();
@@ -291,6 +301,7 @@ impl Live {
                     log!("live: {:.2} s behind, jumping to {wanted:.2} s{}", newest - clock.position(now), if hidden { " (undrawn)" } else { "" });
                 }
                 let to = newest - wanted;
+                self.input.count_jump();
                 self.skip(to, pipe);
                 // The clock stops, and the first picture at `to` starts it again (the UI when the
                 // window draws, `Follower::hidden` when not). Running on to `to` with nothing
@@ -341,9 +352,6 @@ impl Live {
     /// before the clock are decoded but not kept: the first picture is the one at the clock,
     /// at most a keyframe interval of decoding after the frame, with the sound untouched.
     fn rest(&mut self, pipe: &Pipe, idle: Duration) -> bool {
-        if self.on_demand {
-            return false;
-        }
         let anchor = self.clock.get();
         let Some(anchor) = anchor.filter(|_| idle >= REST) else {
             if std::mem::take(&mut self.resting) {
@@ -452,6 +460,7 @@ impl Live {
         s.jump = true;
         if self.on_demand {
             s.ended = None;
+            s.run_ended = None;
         }
     }
 
@@ -690,6 +699,7 @@ impl Live {
         s.frames.push_back(Decoded {
             generation: job.generation,
             pts,
+            run: self.run,
             picture: decoded,
             pushed,
         });

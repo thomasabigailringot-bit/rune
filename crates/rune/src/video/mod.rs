@@ -137,6 +137,15 @@ impl MediaSource {
     fn on_demand(&self) -> bool {
         matches!(self, Self::Live(live) if live.input().config.on_demand)
     }
+
+    /// The length of a fed recording, when the app gave it.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn duration(&self) -> Option<f64> {
+        match self {
+            Self::Live(live) => live.duration(),
+            _ => None,
+        }
+    }
 }
 
 impl From<&str> for MediaSource {
@@ -215,6 +224,9 @@ pub struct PlayerStats {
     pub dropped: u64,
     /// Times playback held with no picture decoded in time.
     pub stalls: u64,
+    /// Live: times the clock jumped forward because it had fallen far behind the stream. A jump
+    /// holds the clock until the first picture at its target, and is not a stall.
+    pub jumps: u64,
     /// Sound device fills that had no decoded sound to write (silence played).
     pub sound_gaps: u64,
     /// Frames of silence those gaps wrote.

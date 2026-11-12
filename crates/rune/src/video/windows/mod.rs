@@ -191,6 +191,10 @@ pub(super) fn stats(shared: &Shared) -> PlayerStats {
         dropped: native.counts.dropped,
         late: native.counts.late + native.pipe.as_ref().map_or(0, |p| p.late.load(Ordering::Relaxed)),
         stalls: native.counts.stalls,
+        jumps: match &shared.source {
+            MediaSource::Live(live) => live.input().jumps(),
+            _ => 0,
+        },
         queue_ms: (live_depth(&native, shared) * 1000.0) as f32,
         latency_ms: native.counts.latency_ms,
         // The clock itself: a live clip's decoder steers it while nothing draws.
@@ -214,8 +218,20 @@ pub(super) fn set_observer(shared: &Shared, observer: Arc<dyn Fn(f64, Instant) +
 }
 
 /// Audio: where the clock has it now. The clock runs only while the sound does, so it's always
-/// the one to read.
+/// the one to read. A fed recording: the clock too while it runs, drawn or not (no picture shows
+/// behind a minimized window, and the position goes on); else the time of the last restart or
+/// picture.
 pub(super) fn live_time(shared: &Shared, _: bool) -> Option<f64> {
+    if shared.source.on_demand() {
+        let native = shared.native.try_lock().ok()?;
+        // A restart not folded in yet: the clock is the one of the run before.
+        if shared.ctl.lock().unwrap().seek.is_some() {
+            return None;
+        }
+        let clock = native.clock.get()?;
+        let position = clock.position(Instant::now());
+        return Some(shared.source.duration().map_or(position, |end| position.min(end)));
+    }
     if shared.kind != Kind::Audio {
         return None;
     }
@@ -240,7 +256,9 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     if let Some(pipe) = &native.pipe {
         pipe.lock().touched = Some(now);
     }
-    if shared.source.is_live() && !shared.source.on_demand() {
+    if shared.source.on_demand() {
+        native.note_return(gap, now);
+    } else if shared.source.is_live() {
         native.join_clock(gap, now);
     }
     native.reconcile(shared, &mut c, target, true);
@@ -423,7 +441,13 @@ impl Native {
         let jumped;
         let picked = {
             let mut inbox = pipe.lock();
-            while inbox.frames.front().is_some_and(|f| f.generation != generation) {
+            // A recording shows nothing of a run older than the newest restart: its time is the
+            // position at every moment.
+            let newest_run = match &shared.source {
+                MediaSource::Live(live) => live.input().restarted().unwrap_or(0),
+                _ => 0,
+            };
+            while inbox.frames.front().is_some_and(|f| f.generation != generation || f.run < newest_run) {
                 inbox.frames.pop_front();
             }
             jumped = std::mem::take(&mut inbox.jump);
@@ -457,16 +481,21 @@ impl Native {
         };
         if jumped {
             // The stream's timeline jumped: the clock starts again at the next picture. A
-            // recording waits for it in any phase: a picture of the old run may have landed first.
-            let at = self.shown.unwrap_or(0.0);
-            let event = if shared.source.on_demand() { Event::Restart { to: at } } else { Event::Stalled { at } };
-            self.event(shared, c, event);
+            // recording needs nothing more: its restart already holds the clock at the new position.
+            if !shared.source.on_demand() {
+                let at = self.shown.unwrap_or(0.0);
+                self.event(shared, c, Event::Stalled { at });
+            }
             return;
         }
         let Some(frame) = picked else {
+            if shared.source.on_demand() {
+                self.note_over(shared, c, &pipe);
+            }
             self.check_end(shared, c, &pipe, generation, target);
             return;
         };
+        let run = frame.run;
         pipe.poke();
         let pts = frame.pts;
         if let Some(pushed) = frame.pushed {
@@ -487,6 +516,9 @@ impl Native {
             self.counts.sync_n += 1;
             self.counts.sync_max = self.counts.sync_max.max(offset.abs());
         }
+        if let MediaSource::Live(live) = &shared.source {
+            live.input().picture_shown(run);
+        }
         if let Some(observer) = &self.observer {
             observer(pts, target);
         }
@@ -506,6 +538,26 @@ impl Native {
         }
     }
 
+    /// A recording whose newest run was taken in to its end, with no picture left to show: it is
+    /// over. A run that gave no picture at all (the media ends before its position, or has a gap
+    /// to the end) leaves the player waiting for one, so it ends there.
+    fn note_over(&mut self, shared: &Arc<Shared>, c: &mut Control, pipe: &Pipe) {
+        let MediaSource::Live(live) = &shared.source else { return };
+        let input = live.input();
+        let Some(run) = input.restarted() else { return };
+        let drained = {
+            let inbox = pipe.lock();
+            inbox.run_ended == Some(run) && inbox.frames.is_empty()
+        };
+        if !drained {
+            return;
+        }
+        input.run_over(run);
+        if let Phase::Buffering { at, .. } = self.phase {
+            self.end(shared, c, at, 0.0);
+        }
+    }
+
     /// A live clip's clock is steered by its decoder thread (`live`), drawn or not, and that
     /// thread also starts and holds it while nothing draws: the phase takes the clock as it is
     /// now (running, or held for a refill), with no anchor of its own, and a frame after a gap
@@ -516,6 +568,12 @@ impl Native {
             (Phase::Playing { clock }, None) => self.phase = Phase::Buffering { at: self.shown.unwrap_or(clock.pos), play: true },
             _ => return,
         }
+        self.note_return(gap, now);
+    }
+
+    /// A frame came back after a gap: the decoder needs a moment to catch up to the clock, and no
+    /// picture is due until then. That is no stall, for a while.
+    fn note_return(&mut self, gap: Option<Duration>, now: Instant) {
         if gap.is_some_and(|g| g > LIVE_IDLE) {
             self.returning = Some(now);
         }

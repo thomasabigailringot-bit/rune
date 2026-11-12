@@ -14,7 +14,9 @@
 //! With [`LiveConfig::on_demand`] the video is a recording instead (a past broadcast): units carry
 //! their media time, the clock starts at the first picture shown and runs at the player's rate,
 //! pause keeps what is queued, and the app owns back-pressure ([`LiveVideo::buffered`]) and seeking
-//! ([`LiveVideo::restart`]).
+//! ([`LiveVideo::restart`]). Every run has a number the app gives it: a picture of an older run than
+//! the newest restart is never shown, so [`Player::time`] is the position at every moment, and the
+//! app can tell which run the picture on the screen belongs to ([`LiveVideo::picture_run`]).
 
 use super::{MediaSource, Player, steer};
 use crate::time::Instant;
@@ -94,8 +96,9 @@ pub(crate) struct Queues {
     pub discontinuity: bool,
     /// The app called [`LiveVideo::finish`].
     pub closed: bool,
-    /// An on-demand run starts here (seconds): pictures and sound before it are not kept.
-    pub restart_at: Option<f64>,
+    /// An on-demand run starts here (seconds) and has this number: pictures and sound before it
+    /// are not kept.
+    pub restart: Option<(f64, u64)>,
 }
 
 /// What the app pushed, for the decoder thread to take.
@@ -114,8 +117,21 @@ pub(crate) struct LiveInput {
     pushed: AtomicU64,
     /// The recording's length in microseconds; `u64::MAX` when not known.
     duration: AtomicU64,
-    /// Where the latest run of a recording starts, in microseconds ([`LiveVideo::restart`]).
-    run_at: AtomicU64,
+    /// The number of the newest run of a recording ([`LiveVideo::restart`]); `NO_RUN` before the first.
+    run: AtomicU64,
+    /// The run of the picture on the screen; `NO_RUN` before the first.
+    picture_run: AtomicU64,
+    /// The newest run that was shown to its end, with no picture left to come; `NO_RUN` before one.
+    over_run: AtomicU64,
+    /// Clock jumps the decoder thread took (the clock fell far behind and moved forward).
+    jumps: AtomicU64,
+}
+
+/// A run number that no run has.
+const NO_RUN: u64 = u64::MAX;
+
+fn run_of(number: &AtomicU64) -> Option<u64> {
+    Some(number.load(Ordering::Acquire)).filter(|run| *run != NO_RUN)
 }
 
 impl LiveInput {
@@ -130,7 +146,10 @@ impl LiveInput {
             origin: AtomicI64::new(if config.on_demand { 0 } else { i64::MIN }),
             pushed: AtomicU64::new(0),
             duration: AtomicU64::new(u64::MAX),
-            run_at: AtomicU64::new(0),
+            run: AtomicU64::new(NO_RUN),
+            picture_run: AtomicU64::new(NO_RUN),
+            over_run: AtomicU64::new(NO_RUN),
+            jumps: AtomicU64::new(0),
         }
     }
 
@@ -165,13 +184,38 @@ impl LiveInput {
             audio: std::mem::take(&mut q.audio),
             discontinuity: std::mem::take(&mut q.discontinuity),
             closed: q.closed,
-            restart_at: q.restart_at.take(),
+            restart: q.restart.take(),
         }
     }
 
     /// Access units pushed so far.
     pub(crate) fn pushed(&self) -> u64 {
         self.pushed.load(Ordering::Relaxed)
+    }
+
+    /// The newest run restarted (a recording).
+    pub(crate) fn restarted(&self) -> Option<u64> {
+        run_of(&self.run)
+    }
+
+    /// A picture of this run reached the surface.
+    pub(crate) fn picture_shown(&self, run: u64) {
+        self.picture_run.store(run, Ordering::Release);
+    }
+
+    /// The run `run` has nothing more to show.
+    pub(crate) fn run_over(&self, run: u64) {
+        self.over_run.store(run, Ordering::Release);
+    }
+
+    /// The clock jumped once more.
+    pub(crate) fn count_jump(&self) {
+        self.jumps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clock jumps taken so far.
+    pub(crate) fn jumps(&self) -> u64 {
+        self.jumps.load(Ordering::Relaxed)
     }
 }
 
@@ -282,28 +326,49 @@ impl LiveVideo {
         self.input.ready.notify_all();
     }
 
-    /// On-demand only: starts a new run at `at` (a seek, a quality switch, the first run). Drops
-    /// what is queued and in flight, sound included, reopens the input after [`LiveVideo::finish`],
-    /// and sets the time base so that [`Player::time`] reports `at` and then follows the pictures.
-    /// The app pushes units from a keyframe at or before `at`; pictures and sound before `at` are
-    /// decoded and not shown. The clock starts at the first picture shown, playing or not (a
-    /// paused video shows it and holds). Does nothing for a live video.
-    pub fn restart(&self, at: Duration) {
+    /// On-demand only: starts the run number `run` at `at` (a seek, a quality switch, the first
+    /// run). Run numbers count up. Drops what is queued and in flight, sound included, reopens the
+    /// input after [`LiveVideo::finish`], and sets the time so that [`Player::time`] reports `at`
+    /// at once and then follows the pictures: no picture of an older run shows from here on. The app
+    /// pushes units from a keyframe at or before `at`; pictures and sound before `at` are decoded
+    /// and not shown. The clock starts at the first picture shown, playing or not (a paused video
+    /// shows it and holds). Does nothing for a live video.
+    pub fn restart(&self, at: Duration, run: u64) {
         if !self.input.config.on_demand {
             return;
         }
         let seconds = at.as_secs_f64();
-        self.input.run_at.store(at.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        // The time and the run change together, under the lock that every picture is shown under,
+        // and before the decoder can make a picture of the new run.
+        self.player.edit(|c| {
+            super::step(c, super::Event::Seek(seconds));
+            self.input.run.store(run, Ordering::Release);
+        });
         let mut q = self.input.queues.lock().unwrap();
         q.video.clear();
         q.audio.clear();
         q.discontinuity = true;
         q.closed = false;
-        q.restart_at = Some(seconds);
+        q.restart = Some((seconds, run));
         drop(q);
         self.input.newest.store(i64::MIN, Ordering::Release);
-        self.player.send(super::Event::Seek(seconds));
         self.input.ready.notify_all();
+    }
+
+    /// On-demand: the newest run given to [`LiveVideo::restart`]. None before the first.
+    pub fn restarted_run(&self) -> Option<u64> {
+        self.input.restarted()
+    }
+
+    /// On-demand: the run of the picture on the screen. None before the first picture.
+    pub fn picture_run(&self) -> Option<u64> {
+        run_of(&self.input.picture_run)
+    }
+
+    /// On-demand: the newest run that has shown all its pictures and has no more to come (the end of
+    /// the media, possibly with none shown at all). None before one.
+    pub fn over_run(&self) -> Option<u64> {
+        run_of(&self.input.over_run)
     }
 
     /// The recording's length, so that [`Player::duration`] answers. `None` for unknown.
@@ -313,12 +378,9 @@ impl LiveVideo {
     }
 
     /// On-demand: media pushed and not yet shown (the newest unit pushed minus [`Player::time`]),
-    /// so the app can stop reading while enough is queued. Pausing does not drain it. The position
-    /// is never before the start of the latest run: until a picture of that run shows, the time
-    /// can still be that of a picture of the run before it.
+    /// so the app can stop reading while enough is queued. Pausing does not drain it.
     pub fn buffered(&self) -> Duration {
-        let run_at = self.input.run_at.load(Ordering::Relaxed) as f64 / 1e6;
-        Duration::from_secs_f64(steer::buffered(self.input.newest_seconds(), self.player.time().max(run_at)))
+        Duration::from_secs_f64(steer::buffered(self.input.newest_seconds(), self.player.time()))
     }
 
     /// The configuration this video was made with, with the delay it aims at now.
