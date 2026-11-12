@@ -165,6 +165,8 @@ impl Live {
     /// The clock jumped forward to `to` seconds: no picture before it is wanted.
     fn skip(&mut self, to: f64, pipe: &Pipe) {
         self.skip_until = Some(to);
+        // A picture decoded before the jump would restart the clock at its own, old time.
+        pipe.lock().frames.retain(|frame| frame.pts >= to);
         let Some(origin) = self.origin else { return };
         // Decoding can only restart at a keyframe: the last one at or before the new time.
         let reachable = |unit: &Pushed<AccessUnit>| {
