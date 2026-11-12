@@ -1,7 +1,9 @@
 //! How a live video's clock follows the stream: the queue's depth (newest picture pushed minus
 //! the clock) against the target decides whether the clock keeps its speed, runs a little faster
 //! to eat a backlog, a little slower to rebuild a thin queue, or jumps. [`backlog_cut`] bounds
-//! what waits for a consumer that is not running.
+//! what waits for a consumer that is not running. While nothing draws, [`Follower::hidden`]
+//! also runs the clock's life cycle: it starts, holds for a refill after an underrun, and
+//! restarts on a new timeline.
 
 /// Faster than this the sound would be too far from itself.
 const MAX_SPEEDUP: f64 = 0.08;
@@ -128,12 +130,36 @@ pub(crate) fn backlog_cut(
     Some(Cut { drop: at, floor })
 }
 
+/// A running clock, as the follower sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct View {
+    /// Where it is now, in seconds.
+    pub pos: f64,
+    pub rate: f64,
+}
+
+/// What the thread that owns the clock of a stream nobody draws should do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Life {
+    Steer(Steer),
+    /// The queue ran dry (the clock passed the newest media): stop it at `at` and wait for media.
+    Hold { at: f64 },
+    /// Enough media waits: start the clock at `pos`, at 1x.
+    Start { pos: f64 },
+}
+
+/// The shortest queue a stopped clock starts on, in seconds, whatever the target: under it the
+/// clock would run dry again at once.
+const MIN_START: f64 = 0.02;
+
 /// The memory of a clock that follows a stream: the last target it steered to, and whether the
 /// queue still grows to a target raised since. One follower steers one clock.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Follower {
     seen: Option<f64>,
     refill: bool,
+    /// Where the clock stopped for want of media, and starts again from.
+    held: Option<f64>,
 }
 
 impl Follower {
@@ -149,6 +175,48 @@ impl Follower {
             self.refill = false;
         }
         steer(depth, target, rate, self.refill)
+    }
+
+    /// One step of a clock nobody draws, whose life cycle this thread owns. `clock` is the
+    /// clock now (None: stopped), `newest` the newest media time pushed (None: no media yet),
+    /// `play` whether the app wants the stream to play. A running clock is steered as [`step`]
+    /// does, and held when it passes the newest media. A stopped clock starts once the media
+    /// after its start (the hold, else the timeline's start) reaches the target, so sound resumes
+    /// when the queue is rebuilt, not when the stream's gap has been played out in silence.
+    pub(crate) fn hidden(&mut self, clock: Option<View>, newest: Option<f64>, target: f64, play: bool) -> Life {
+        let Some(newest) = newest else { return Life::Steer(Steer::Keep) };
+        if let Some(view) = clock {
+            self.held = None;
+            let depth = newest - view.pos;
+            if depth < 0.0 {
+                self.held = Some(newest);
+                self.refill = false;
+                return Life::Hold { at: newest };
+            }
+            return Life::Steer(self.step(depth, target, view.rate));
+        }
+        let from = self.held.unwrap_or(0.0).min(newest);
+        let waiting = newest - from;
+        if !play || waiting < (target - slack(target)).max(MIN_START) {
+            return Life::Steer(Steer::Keep);
+        }
+        self.held = None;
+        self.refill = false;
+        self.seen = Some(target);
+        // Far more than the target waits (a long stall, then a burst): start at the target
+        // behind the stream rather than at the hold, which the clock would jump from at once.
+        let pos = if waiting > target + hard(target) { newest - target } else { from };
+        Life::Start { pos }
+    }
+
+    /// The window draws: the UI owns the clock's start and stops, so a hold is forgotten.
+    pub(crate) fn drawn(&mut self) {
+        self.held = None;
+    }
+
+    /// The stream's timeline restarted: nothing of the old one is held.
+    pub(crate) fn restart(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -179,6 +247,106 @@ mod tests {
         // The rate left at 1.012 when the window stopped drawing returns to exactly 1.
         let mut f = Follower::default();
         assert_eq!(f.step(0.5, 0.5, 1.012), Steer::Rate(1.0));
+    }
+
+    const RUN: f64 = 1.0;
+
+    fn view(pos: f64) -> Option<View> {
+        Some(View { pos, rate: RUN })
+    }
+
+    #[test]
+    fn a_stopped_clock_starts_once_the_target_is_queued_while_hidden() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, None, 0.5, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(0.2), 0.5, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(0.46), 0.5, true), Life::Start { pos: 0.0 });
+        // A stream that is not to play does not start.
+        assert_eq!(Follower::default().hidden(None, Some(3.0), 0.5, false), Life::Steer(Steer::Keep));
+    }
+
+    #[test]
+    fn a_start_on_a_burst_begins_at_the_target_behind_the_stream() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, Some(0.9), 0.5, true), Life::Start { pos: 0.0 });
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, Some(5.0), 0.5, true), Life::Start { pos: 4.5 });
+    }
+
+    #[test]
+    fn a_tiny_target_still_waits_for_some_media() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, Some(0.0), 0.0, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(0.03), 0.0, true), Life::Start { pos: 0.0 });
+    }
+
+    #[test]
+    fn an_underrun_holds_the_clock_and_a_refill_restarts_it() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(view(1.0), Some(1.3), 0.3, true), Life::Steer(Steer::Keep));
+        // The stream stops at 1.3 s while the clock runs on past it.
+        assert_eq!(f.hidden(view(1.35), Some(1.3), 0.3, true), Life::Hold { at: 1.3 });
+        // Stopped: nothing starts until the target is queued after the hold.
+        assert_eq!(f.hidden(None, Some(1.3), 0.3, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(1.5), 0.3, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(1.58), 0.3, true), Life::Start { pos: 1.3 });
+        // Running again, at the target: nothing to do, and no leftover refill.
+        assert_eq!(f.hidden(view(1.3), Some(1.58), 0.3, true), Life::Steer(Steer::Keep));
+    }
+
+    #[test]
+    fn a_long_stall_then_a_burst_restarts_at_the_target_behind_the_stream() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(view(2.0), Some(1.9), 0.3, true), Life::Hold { at: 1.9 });
+        // 30 s of media arrive at once: it starts at the target behind the newest, not at the hold.
+        assert_eq!(f.hidden(None, Some(32.0), 0.5, true), Life::Start { pos: 31.5 });
+        assert_eq!(f.hidden(view(31.5), Some(32.0), 0.5, true), Life::Steer(Steer::Keep));
+    }
+
+    #[test]
+    fn a_burst_short_of_a_jump_starts_at_the_hold() {
+        let mut f = Follower::default();
+        f.hidden(view(2.0), Some(1.9), 0.3, true);
+        assert_eq!(f.hidden(None, Some(2.9), 0.3, true), Life::Start { pos: 1.9 });
+    }
+
+    #[test]
+    fn a_running_clock_far_behind_jumps_while_hidden() {
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(view(0.0), Some(6.0), 0.5, true), Life::Steer(Steer::Jump));
+    }
+
+    #[test]
+    fn a_discontinuity_while_hidden_starts_over_on_the_new_timeline() {
+        let mut f = Follower::default();
+        f.hidden(view(9.0), Some(8.9), 0.3, true);
+        assert!(f.held.is_some());
+        f.restart();
+        // The new timeline counts from 0: the old hold does not carry over.
+        assert_eq!(f.hidden(None, Some(0.1), 0.3, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(0.27), 0.3, true), Life::Start { pos: 0.0 });
+    }
+
+    #[test]
+    fn a_target_change_while_hidden_moves_the_start_and_the_steering() {
+        // Stopped: a raised target waits for more media, a lowered one for less.
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, Some(0.3), 0.3, true), Life::Start { pos: 0.0 });
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(None, Some(0.3), 1.0, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(None, Some(0.3), 0.2, true), Life::Start { pos: 0.0 });
+        // Running: a raised target slows the clock down, as when drawn.
+        let mut f = Follower::default();
+        assert_eq!(f.hidden(view(0.0), Some(0.3), 0.3, true), Life::Steer(Steer::Keep));
+        assert_eq!(f.hidden(view(0.0), Some(0.3), 1.0, true), Life::Steer(Steer::Rate(1.0 - REFILL)));
+    }
+
+    #[test]
+    fn a_drawn_window_forgets_the_hold() {
+        let mut f = Follower::default();
+        f.hidden(view(2.0), Some(1.9), 0.3, true);
+        f.drawn();
+        assert_eq!(f.hidden(None, Some(0.31), 0.3, true), Life::Start { pos: 0.0 });
     }
 
     #[test]
