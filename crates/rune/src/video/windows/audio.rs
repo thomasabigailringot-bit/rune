@@ -44,14 +44,19 @@ pub(super) struct Clock {
 }
 
 impl Clock {
+    /// The anchor's lock. The anchor is plain data that a panic cannot leave half written, so a
+    /// poisoned lock is taken as it is: a thread that died must not take the others with it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Anchor>> {
+        self.anchor.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     pub(super) fn set(&self, anchor: Option<Anchor>) {
-        *self.anchor.lock().unwrap() = anchor;
+        *self.lock() = anchor;
         self.changed.notify_all();
     }
     /// Changes the anchor of a clock that runs, atomically: nothing happens if it stopped since
     /// the caller read it (a thread that steers a live clock must not start it again).
     pub(super) fn update(&self, change: impl FnOnce(Anchor) -> Anchor) {
-        let mut anchor = self.anchor.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut anchor = self.lock();
         if let Some(a) = *anchor {
             *anchor = Some(change(a));
             drop(anchor);
@@ -85,12 +90,12 @@ impl Clock {
         self.gaps.load(Ordering::Relaxed)
     }
     pub(super) fn get(&self) -> Option<Anchor> {
-        *self.anchor.lock().unwrap()
+        *self.lock()
     }
     /// Sleeps until the clock runs at 1x (or patience passes) while it doesn't: sound plays
     /// only at normal speed.
     fn wait_while_stopped(&self, patience: Duration) {
-        let anchor = self.anchor.lock().unwrap();
+        let anchor = self.lock();
         if anchor.is_none_or(|a| !self.follows(a.rate)) {
             let _ = self.changed.wait_timeout(anchor, patience);
         }
