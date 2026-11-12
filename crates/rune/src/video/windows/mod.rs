@@ -464,8 +464,14 @@ impl Native {
         }
         if let Phase::Buffering { .. } = self.phase {
             // A live clock starts its delay behind the first picture: the jitter buffer.
+            // What the stream already holds past this picture counts toward the delay, so a
+            // start on a burst does not wait a second time.
             let delay = match &shared.source {
-                MediaSource::Live(live) => live.input().config.target_delay.as_secs_f64(),
+                MediaSource::Live(live) => {
+                    let input = live.input();
+                    let held = input.newest_seconds().map_or(0.0, |newest| (newest - pts).max(0.0));
+                    (input.config.target_delay.as_secs_f64() - held).max(0.0)
+                }
                 _ => 0.0,
             };
             self.event(shared, c, Event::Shown { pts: pts - delay, target, lead, rate: f64::from(c.rate) });
@@ -488,6 +494,11 @@ impl Native {
             super::steer::Steer::Jump => {
                 if decoder::logging() {
                     decoder::log!("live: {depth:.2} s behind, jumping to {wanted:.2} s");
+                }
+                // The decoder skips to the same time: decoding what the jump passed over
+                // would only keep it behind.
+                if let Some(pipe) = &self.pipe {
+                    pipe.lock().skip_to = Some(newest - wanted);
                 }
                 self.event(shared, c, Event::Resumed { target, at: newest - wanted - lead, lead });
             }

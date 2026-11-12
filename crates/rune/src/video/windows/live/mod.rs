@@ -72,6 +72,8 @@ struct Live {
     pending: VecDeque<(i64, Instant)>,
     /// Access units that wait for their turn to be decoded.
     backlog: VecDeque<Pushed<AccessUnit>>,
+    /// After a jump: pictures before this time (seconds) are decoded but not kept.
+    skip_until: Option<f64>,
     /// Where the next sound block starts, if the transform stamps none.
     sound_next: f64,
     clock: Arc<audio::Clock>,
@@ -113,6 +115,7 @@ impl Live {
             synced: false,
             pending: VecDeque::new(),
             backlog: VecDeque::new(),
+            skip_until: None,
             sound_next: 0.0,
             clock: job.clock.clone(),
         })
@@ -120,12 +123,12 @@ impl Live {
 
     fn work(&mut self, pipe: &Pipe, job: &Job) -> Result<(), String> {
         loop {
-            let sound = {
-                let s = pipe.lock();
+            let (sound, skip) = {
+                let mut s = pipe.lock();
                 if s.stop {
                     return Ok(());
                 }
-                s.sound
+                (s.sound, s.skip_to.take())
             };
             self.follow_sound(sound);
             let queues = self.input.take(PATIENCE);
@@ -140,6 +143,9 @@ impl Live {
             // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
             // (`target_delay`) waits here as access units, which cost far less than pictures.
             self.backlog.extend(queues.video);
+            if let Some(to) = skip {
+                self.skip(to, pipe);
+            }
             while pipe.lock().frames.len() < AHEAD {
                 let Some(unit) = self.backlog.pop_front() else { break };
                 self.video_unit(unit, pipe, job)?;
@@ -153,6 +159,24 @@ impl Live {
                 (job.notify)();
                 return Ok(());
             }
+        }
+    }
+
+    /// The clock jumped forward to `to` seconds: no picture before it is wanted.
+    fn skip(&mut self, to: f64, pipe: &Pipe) {
+        self.skip_until = Some(to);
+        let Some(origin) = self.origin else { return };
+        // Decoding can only restart at a keyframe: the last one at or before the new time.
+        let reachable = |unit: &Pushed<AccessUnit>| {
+            unit.item.keyframe && (unit.item.pts - origin) as f64 / 90_000.0 <= to
+        };
+        if let Some(first) = self.backlog.iter().rposition(reachable)
+            && first > 0
+        {
+            self.backlog.drain(..first);
+            self.video.flush();
+            self.pending.clear();
+            pipe.lock().frames.clear();
         }
     }
 
@@ -193,6 +217,7 @@ impl Live {
             output.flush();
         }
         self.synced = false;
+        self.skip_until = None;
         self.origin = None;
         self.input.set_origin(None);
         self.pending.clear();
@@ -363,6 +388,10 @@ impl Live {
         };
         let picture = self.video.picture.ok_or("no picture size")?;
         let pts = (time - hundred_ns(self.origin.unwrap_or(0))) as f64 / 1e7;
+        if self.skip_until.is_some_and(|to| pts < to) {
+            return Ok(());
+        }
+        self.skip_until = None;
         let decoded = if let Some(ring) = &mut self.ring {
             let Some(slot) = ring.take()? else {
                 if pipe.late.fetch_add(1, Ordering::Relaxed) == 0 && logging() {

@@ -47,6 +47,8 @@ pub(super) struct Inbox {
     pub ended: Option<u32>,
     /// Live: the stream's timeline jumped; the clock starts again at the next picture.
     pub jump: bool,
+    /// Live: the clock jumped forward to this time (seconds); earlier pictures have no use.
+    pub skip_to: Option<f64>,
 }
 
 pub(super) enum News {
