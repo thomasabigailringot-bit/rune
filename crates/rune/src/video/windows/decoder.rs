@@ -38,6 +38,8 @@ pub(super) struct Inbox {
     pub looping: bool,
     /// Play sound, at this gain (unmuted, and the clip has some).
     pub sound: Option<f32>,
+    /// The handle plays (not paused): a live clock nobody draws may start.
+    pub play: bool,
     pub stop: bool,
     /// When a frame last drew the clip.
     pub touched: Option<Instant>,

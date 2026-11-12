@@ -5,8 +5,9 @@
 //! on the queue as soon as the transform gives it.
 //!
 //! This thread owns the clock's speed (`crate::video::steer` says how it follows the stream) and
-//! steers it whether or not a window draws, so the sound stays on the stream behind a covered or
-//! minimized window. Decoded pictures wait for the UI (`Native::show`). While nothing draws (no
+//! steers it whether or not a window draws. While nothing draws it owns the clock's whole life
+//! cycle (start, hold for a refill after an underrun, restart after a discontinuity), so the
+//! sound stays on the stream behind a covered or minimized window. Decoded pictures wait for the UI (`Native::show`). While nothing draws (no
 //! frame for `REST`) no picture is decoded at all: the access units wait from the last keyframe
 //! before the clock, and decoding restarts there when a frame draws again.
 
@@ -40,9 +41,11 @@ const AHEAD: usize = 8;
 /// A live clip undrawn this long is at rest: its decoder decodes no pictures, and its clock is
 /// steered here. (Shorter hitches of the UI are not worth dropping the pictures for.)
 const REST: Duration = Duration::from_millis(500);
-/// A clip's clock is steered here once no frame has drawn it for this long; the frame that
-/// draws it steers it otherwise.
+/// A clip's clock is started, held and restarted here once no frame has drawn it for this long;
+/// the frame that draws it does so otherwise (this thread then only steers its speed).
 const UNDRAWN: Duration = Duration::from_millis(100);
+/// The longest this thread decodes pictures before it looks at the sound again.
+const SLICE: Duration = Duration::from_millis(6);
 /// How long the thread waits for something to arrive before it looks at the pipe again.
 const PATIENCE: Duration = Duration::from_millis(4);
 
@@ -146,15 +149,17 @@ impl Live {
 
     fn work(&mut self, pipe: &Pipe, job: &Job) -> Result<(), String> {
         loop {
-            let (sound, idle) = {
+            let (sound, play, idle, room) = {
                 let s = pipe.lock();
                 if s.stop {
                     return Ok(());
                 }
-                (s.sound, s.touched.map_or(Duration::ZERO, |t| t.elapsed()))
+                (s.sound, s.play, s.touched.map_or(Duration::ZERO, |t| t.elapsed()), s.frames.len() < AHEAD)
             };
             self.follow_sound(sound);
-            let queues = self.input.take(PATIENCE);
+            // Units left over from the last pass's slice of decoding do not wait for news.
+            let patience = if room && !self.resting && !self.backlog.is_empty() { Duration::ZERO } else { PATIENCE };
+            let queues = self.input.take(patience);
             if queues.discontinuity {
                 self.backlog.clear();
                 self.restart(pipe);
@@ -169,11 +174,17 @@ impl Live {
             for frame in queues.audio {
                 self.sound_frame(frame, sound.is_some());
             }
-            self.follow(pipe, idle);
+            self.follow(pipe, idle, play);
             let resting = self.rest(pipe, idle);
+            // A slice of decoding at a time: after a long rest the pictures from a keyframe to
+            // the clock are decoded and dropped, and the sound must not wait for all of them.
+            let began = Instant::now();
             while !resting && pipe.lock().frames.len() < AHEAD {
                 let Some(unit) = self.backlog.pop_front() else { break };
                 self.video_unit(unit, pipe, job)?;
+                if began.elapsed() >= SLICE {
+                    break;
+                }
             }
             if queues.closed && !self.backlog.is_empty() {
                 // `take` no longer waits once the input is closed.
@@ -222,57 +233,76 @@ impl Live {
     }
 
     /// Steers the clock: faster for a backlog, slower for a thin queue, forward when it is far
-    /// behind. The clock runs only while the UI shows the clip (`Native`); from then on this
-    /// thread is the only one that changes its speed.
-    fn follow(&mut self, pipe: &Pipe, idle: Duration) {
+    /// behind. While a frame draws the clip the UI starts and stops the clock (`Native::show`)
+    /// and this thread only changes its speed. While nothing draws, this thread owns the whole
+    /// life cycle (`Follower::hidden`): it starts the clock when media is ready, holds it when
+    /// the queue runs dry until the target is queued again, and restarts it after a
+    /// discontinuity. The UI takes the clock as it is when it draws again.
+    fn follow(&mut self, pipe: &Pipe, idle: Duration, play: bool) {
+        let hidden = idle > UNDRAWN;
         if self.reanchor {
-            self.rejoin(pipe, idle);
-            return;
+            self.rejoin(pipe, hidden);
+            if self.reanchor {
+                return;
+            }
         }
-        let Some(clock) = self.clock.get() else { return };
-        let Some(newest) = self.input.newest_seconds() else { return };
-        let wanted = self.input.target_seconds();
         let now = Instant::now();
-        let depth = newest - clock.position(now);
-        match self.follower.step(depth, wanted, clock.rate) {
-            steer::Steer::Keep => {}
-            steer::Steer::Rate(rate) => {
+        let (clock, newest, wanted) = (self.clock.get(), self.input.newest_seconds(), self.input.target_seconds());
+        let life = if hidden {
+            let view = clock.map(|a| steer::View { pos: a.position(now), rate: a.rate });
+            self.follower.hidden(view, newest, wanted, play)
+        } else {
+            self.follower.drawn();
+            let (Some(clock), Some(newest)) = (clock, newest) else { return };
+            steer::Life::Steer(self.follower.step(newest - clock.position(now), wanted, clock.rate))
+        };
+        match life {
+            steer::Life::Steer(steer::Steer::Keep) => {}
+            steer::Life::Steer(steer::Steer::Rate(rate)) => {
                 self.clock.update(|a| Anchor { at: now, pos: a.position(now), rate });
             }
-            steer::Steer::Jump => {
+            steer::Life::Steer(steer::Steer::Jump) => {
+                let (Some(clock), Some(newest)) = (clock, newest) else { return };
                 if logging() {
-                    log!("live: {depth:.2} s behind, jumping to {wanted:.2} s{}", if idle > UNDRAWN { " (undrawn)" } else { "" });
+                    log!("live: {:.2} s behind, jumping to {wanted:.2} s{}", newest - clock.position(now), if hidden { " (undrawn)" } else { "" });
                 }
                 let to = newest - wanted;
                 self.clock.update(|a| Anchor { at: now, pos: to, rate: a.rate });
                 self.skip(to, pipe);
             }
+            steer::Life::Hold { at } => {
+                self.clock.set(None);
+                if logging() {
+                    log!("live: queue ran dry while undrawn, clock held at {at:.2} s until {wanted:.2} s is queued");
+                }
+            }
+            steer::Life::Start { pos } => {
+                self.clock.set(Some(Anchor { at: now, pos, rate: 1.0 }));
+                self.skip(pos, pipe);
+                if logging() {
+                    log!("live: clock starts at {pos:.2} s while undrawn");
+                }
+            }
         }
     }
 
-    /// After a discontinuity nobody drew: the clock starts again on the new timeline, at the
-    /// target behind the stream, so the sound goes on. A frame that draws takes the discontinuity
-    /// itself (`Native::show`) and shows the first picture.
-    fn rejoin(&mut self, pipe: &Pipe, idle: Duration) {
-        if self.origin.is_none()
-            && let Some(first) = self.backlog.front()
-        {
-            self.seconds(first.item.pts);
-        }
-        let Some(newest) = self.input.newest_seconds() else { return };
+    /// After a discontinuity: if nobody drew, the clock stops and the follower starts over, so
+    /// the clock starts on the new timeline when the target is queued (`follow`), whatever it
+    /// was doing, stopped or not. A frame that draws takes the discontinuity itself
+    /// (`Native::show`) and shows the first picture.
+    fn rejoin(&mut self, pipe: &Pipe, hidden: bool) {
         let mut s = pipe.lock();
         if !s.jump {
             self.reanchor = false;
-        } else if idle > UNDRAWN {
+        } else if hidden {
             s.jump = false;
             drop(s);
             self.reanchor = false;
-            let (now, to) = (Instant::now(), newest - self.input.target_seconds());
-            self.clock.update(|_| Anchor { at: now, pos: to, rate: 1.0 });
-            self.skip_until = Some(to);
-            self.follower = steer::Follower::default();
+            self.clock.set(None);
+            self.skip_until = None;
+            self.follower.restart();
             if logging() {
-                log!("live: new timeline while undrawn, clock restarts at {to:.2} s");
+                log!("live: new timeline while undrawn, clock restarts when it is queued");
             }
         }
     }

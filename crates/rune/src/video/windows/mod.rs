@@ -384,9 +384,10 @@ impl Native {
         let sound = self.sounding(c).then_some(c.volume);
         if let Some(pipe) = &self.pipe {
             let mut inbox = pipe.lock();
-            if inbox.looping != c.looping || inbox.sound != sound {
+            if inbox.looping != c.looping || inbox.sound != sound || inbox.play != c.playing() {
                 inbox.looping = c.looping;
                 inbox.sound = sound;
+                inbox.play = c.playing();
                 drop(inbox);
                 pipe.poke();
             }
@@ -497,12 +498,15 @@ impl Native {
         }
     }
 
-    /// A live clip's clock is steered by its decoder thread (`live`), drawn or not: the phase
-    /// takes the clock as it is now, and a frame after a gap notes that it came back.
+    /// A live clip's clock is steered by its decoder thread (`live`), drawn or not, and that
+    /// thread also starts and holds it while nothing draws: the phase takes the clock as it is
+    /// now (running, or held for a refill), with no anchor of its own, and a frame after a gap
+    /// notes that it came back.
     fn join_clock(&mut self, gap: Option<Duration>, now: Instant) {
-        let Phase::Playing { .. } = self.phase else { return };
-        if let Some(clock) = self.clock.get() {
-            self.phase = Phase::Playing { clock };
+        match (self.phase, self.clock.get()) {
+            (Phase::Playing { .. } | Phase::Buffering { play: true, .. }, Some(clock)) => self.phase = Phase::Playing { clock },
+            (Phase::Playing { clock }, None) => self.phase = Phase::Buffering { at: self.shown.unwrap_or(clock.pos), play: true },
+            _ => return,
         }
         if gap.is_some_and(|g| g > LIVE_IDLE) {
             self.returning = Some(now);
