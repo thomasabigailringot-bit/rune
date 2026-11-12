@@ -23,6 +23,8 @@ type CreateAttributes = unsafe extern "system" fn(*mut *mut core::ffi::c_void, u
 type CreateMediaType = unsafe extern "system" fn(*mut *mut core::ffi::c_void) -> HRESULT;
 type CreateDeviceManager = unsafe extern "system" fn(*mut u32, *mut *mut core::ffi::c_void) -> HRESULT;
 type CreateResolver = unsafe extern "system" fn(*mut *mut core::ffi::c_void) -> HRESULT;
+type CreateSample = unsafe extern "system" fn(*mut *mut core::ffi::c_void) -> HRESULT;
+type CreateMemoryBuffer = unsafe extern "system" fn(u32, *mut *mut core::ffi::c_void) -> HRESULT;
 type CreateReaderFromSource = unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> HRESULT;
 
 /// The few flat Media Foundation entry points; everything else is COM.
@@ -32,6 +34,8 @@ pub(super) struct Library {
     create_device_manager: CreateDeviceManager,
     create_resolver: CreateResolver,
     create_reader: CreateReaderFromSource,
+    create_sample: CreateSample,
+    create_memory_buffer: CreateMemoryBuffer,
 }
 
 static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
@@ -54,6 +58,8 @@ fn load() -> Result<Library, String> {
             create_device_manager: symbol(plat, c"MFCreateDXGIDeviceManager").ok_or_else(missing)?,
             create_resolver: symbol(plat, c"MFCreateSourceResolver").ok_or_else(missing)?,
             create_reader: symbol(rw, c"MFCreateSourceReaderFromMediaSource").ok_or_else(missing)?,
+            create_sample: symbol(plat, c"MFCreateSample").ok_or_else(missing)?,
+            create_memory_buffer: symbol(plat, c"MFCreateMemoryBuffer").ok_or_else(missing)?,
         };
         // MFSTARTUP_FULL: the network source needs sockets.
         startup(MF_VERSION, 0).ok().map_err(|e| format!("Media Foundation didn't start: {}", e.message()))?;
@@ -86,7 +92,7 @@ impl Library {
         unsafe { (self.create_attributes)(&mut raw, count).ok().map_err(|e| e.message())?; Ok(IMFAttributes::from_raw(raw)) }
     }
 
-    fn media_type(&self) -> Result<IMFMediaType, String> {
+    pub(super) fn media_type(&self) -> Result<IMFMediaType, String> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: as `attributes`.
         unsafe { (self.create_media_type)(&mut raw).ok().map_err(|e| e.message())?; Ok(IMFMediaType::from_raw(raw)) }
@@ -112,6 +118,38 @@ impl Library {
             resolver.CreateObjectFromURL(&url, flags, None, &mut kind, &mut object).map_err(open_error)?;
             object.ok_or("no media source")?.cast::<IMFMediaSource>().map_err(|e| e.message())
         }
+    }
+
+    /// A sample holding a copy of `bytes`, stamped `time` (100 ns units).
+    pub(super) fn sample_of(&self, bytes: &[u8], time: i64) -> Result<IMFSample, String> {
+        let buffer = self.buffer(bytes.len() as u32)?;
+        // SAFETY: the buffer is locked for the copy and unlocked after it; `SetCurrentLength`
+        // covers exactly what was written.
+        unsafe {
+            let (mut base, mut max) = (std::ptr::null_mut(), 0u32);
+            buffer.Lock(&mut base, Some(&mut max), None).map_err(|e| e.message())?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len().min(max as usize));
+            let _ = buffer.Unlock();
+            buffer.SetCurrentLength(bytes.len().min(max as usize) as u32).map_err(|e| e.message())?;
+            let sample = self.empty_sample()?;
+            sample.AddBuffer(&buffer).map_err(|e| e.message())?;
+            sample.SetSampleTime(time).map_err(|e| e.message())?;
+            Ok(sample)
+        }
+    }
+
+    /// A sample with no buffer yet.
+    pub(super) fn empty_sample(&self) -> Result<IMFSample, String> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: as `attributes`.
+        unsafe { (self.create_sample)(&mut raw).ok().map_err(|e| e.message())?; Ok(IMFSample::from_raw(raw)) }
+    }
+
+    /// A system-memory buffer of `len` bytes.
+    pub(super) fn buffer(&self, len: u32) -> Result<IMFMediaBuffer, String> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: as `attributes`.
+        unsafe { (self.create_memory_buffer)(len, &mut raw).ok().map_err(|e| e.message())?; Ok(IMFMediaBuffer::from_raw(raw)) }
     }
 
     fn reader(&self, source: &IMFMediaSource, attributes: &IMFAttributes) -> Result<IMFSourceReader, String> {
@@ -267,7 +305,7 @@ fn no_decoder(e: windows::core::Error, what: &str) -> String {
 }
 
 /// Facts about the decoded picture from the reader's NV12 type.
-unsafe fn picture(t: &IMFMediaType) -> Result<Picture, String> {
+pub(super) unsafe fn picture(t: &IMFMediaType) -> Result<Picture, String> {
     // SAFETY: attribute reads on a live media type.
     unsafe {
         let size = t.GetUINT64(&MF_MT_FRAME_SIZE).map_err(|_| "video track has no size".to_string())?;
@@ -346,6 +384,7 @@ pub(super) fn seek(reader: &IMFSourceReader, seconds: f64) -> Result<(), String>
 
 fn url(source: &MediaSource) -> Result<HSTRING, String> {
     match source {
+        MediaSource::Live(_) => Err("a live video has no URL".into()),
         MediaSource::File(path) => {
             if !path.exists() {
                 return Err(format!("no such file: {}", path.display()));

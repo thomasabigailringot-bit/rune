@@ -115,6 +115,7 @@ pub(super) fn extension(source: &MediaSource) -> Option<String> {
             let path = path.split_once("://").map_or(path, |(_, rest)| rest.split_once('/').map_or("", |(_, path)| path));
             path.rsplit('/').next().unwrap_or_default().to_string()
         }
+        MediaSource::Live(_) => return None,
     };
     Some(name.rsplit_once('.')?.1.to_ascii_lowercase()).filter(|ext| !ext.is_empty())
 }
@@ -175,6 +176,7 @@ fn url(source: &MediaSource) -> Result<Retained<NSURL>, String> {
             Ok(NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
         }
         MediaSource::Url(url) => NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| format!("invalid URL: {url}")),
+        MediaSource::Live(_) => Err("live video isn't supported on macOS yet".into()),
     }
 }
 

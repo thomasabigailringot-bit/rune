@@ -19,6 +19,9 @@ use windows::core::{GUID, HRESULT, Interface};
 /// Pictures a player's ring holds: the few the decoder runs ahead, the one on screen, one the GPU
 /// may still be reading and a spare.
 pub(super) const RING: usize = 6;
+/// The ring of a live video. Its decoder doesn't wait for a picture's turn the way a clip's does,
+/// and the clock may run behind the stream for a while, so more pictures are in flight.
+pub(super) const RING_LIVE: usize = 24;
 
 type CreateDevice = unsafe extern "system" fn(
     *mut core::ffi::c_void,
@@ -117,10 +120,12 @@ pub(super) struct Ring {
     ready: ID3D11Fence,
     value: u64,
     crop: (u32, u32, u32, u32),
+    /// How many pictures the ring holds at most.
+    capacity: usize,
 }
 
 impl Ring {
-    pub(super) fn new(device: Arc<Device>, picture: &Picture) -> Result<Self, String> {
+    pub(super) fn new(device: Arc<Device>, picture: &Picture, capacity: usize) -> Result<Self, String> {
         // SAFETY: fences made on Rune's device and opened on the D3D11 one through a shared
         // handle, closed once both hold the object.
         let (fences, ready) = unsafe {
@@ -133,12 +138,12 @@ impl Ring {
             opened.map_err(|e| format!("open fence: {}", e.message()))?;
             (Arc::new(VideoFences { ready: ready12, release }), ready.ok_or("open fence")?)
         };
-        Ok(Self { device, slots: Vec::with_capacity(RING), fences, ready, value: 0, crop: picture.crop })
+        Ok(Self { device, slots: Vec::with_capacity(capacity), fences, ready, value: 0, crop: picture.crop, capacity })
     }
 
     /// Whether a picture could be written now: a slot is free, or there's room for another.
     pub(super) fn free(&self) -> bool {
-        self.slots.len() < RING || self.reusable().is_some()
+        self.slots.len() < self.capacity || self.reusable().is_some()
     }
 
     /// A slot no picture on screen, in a queue or in flight on the GPU uses.
@@ -154,7 +159,7 @@ impl Ring {
         if let Some(i) = self.reusable() {
             return Ok(Some(i));
         }
-        if self.slots.len() == RING {
+        if self.slots.len() == self.capacity {
             return Ok(None);
         }
         let (_, _, w, h) = self.crop;

@@ -1957,6 +1957,16 @@ tap.play();
   or `Failed(message)`, plus `time()`, `duration()`, `natural_size()`.
 - **Sound**: `Player::file`/`url`/`new` make videos, which start muted. `Player::audio` makes
   an audio clip, which starts unmuted. `set_muted` changes either.
+- **Live video** (Windows): `LiveVideo::new(LiveConfig::default())` is a `Player` whose pictures
+  and sound the app pushes: `push_video(AccessUnit)` with H.264 in Annex B form and
+  `push_audio(AacFrame)` with ADTS frames, stamped in 90 kHz ticks, as a demuxer yields them.
+  Rune decodes on the GPU, keeps a jitter buffer of `LiveConfig::target_delay` (80 ms by default),
+  and runs the clock against the sound device, speeding up a little to eat a backlog. Draw it
+  with `el().video(&live, SurfaceFit::Fit)`. `discontinuity()` restarts the clock at the next
+  keyframe, and `finish()` ends the stream. It has no duration and cannot seek; elsewhere it
+  fails like any clip. `Player::stats()` counts pictures shown, dropped and late, stalls and sound
+  gaps, and says how deep the queue is and what each picture's latency was.
+  `set_picture_observer` calls back with each picture's time and the instant it presents.
 - **Request headers**: `Player::request(url).header("Authorization", token).audio()` (or
   `.video()`) opens a URL with HTTP headers on every request, for media behind
   authentication. Header values never appear in `Debug` output.

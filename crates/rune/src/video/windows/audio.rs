@@ -19,6 +19,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// The device's buffer: long enough to ride out a busy decoder, short enough to react.
 pub(super) const BUFFER: Duration = Duration::from_millis(100);
+/// A live video's: its sound is only a jitter buffer ahead of the clock, so the device holds less.
+pub(super) const BUFFER_LIVE: Duration = Duration::from_millis(20);
 /// Sound decoded ahead of what's heard; the decoder waits beyond it.
 const AHEAD: f64 = 1.0;
 /// How far written sound may drift from the clock before it jumps back in line.

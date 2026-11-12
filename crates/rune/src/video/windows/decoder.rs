@@ -14,7 +14,7 @@ use crate::native_surface::ByteFrame;
 use crate::native_surface::windows::DecodedPlanes;
 use crate::time::Instant;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_DECODER, ID3D11Texture2D};
@@ -45,6 +45,8 @@ pub(super) struct Inbox {
     pub frames: VecDeque<Decoded>,
     /// The generation whose last picture is in the queue: the clip ended there.
     pub ended: Option<u32>,
+    /// Live: the stream's timeline jumped; the clock starts again at the next picture.
+    pub jump: bool,
 }
 
 pub(super) enum News {
@@ -52,6 +54,8 @@ pub(super) enum News {
     Failed(String),
     /// Let go after `PARK` undrawn.
     Parked,
+    /// A live video's pictures changed size: the new facts.
+    Resized(Facts),
 }
 
 /// What opening found.
@@ -71,6 +75,8 @@ pub(super) struct Decoded {
     /// Seconds from the clip's start, counting on through loops.
     pub pts: f64,
     pub picture: Pic,
+    /// Live: when the access unit this picture decodes from was pushed.
+    pub pushed: Option<Instant>,
 }
 
 pub(super) enum Pic {
@@ -82,6 +88,10 @@ pub(super) struct Pipe {
     inbox: Mutex<Inbox>,
     /// What the first decoded picture showed: 0 unknown, 1 software, 2 hardware.
     pub hardware: AtomicU8,
+    /// Live: pictures the pipeline lost, and the access units the decoder took in before its
+    /// first picture.
+    pub late: AtomicU64,
+    pub hold: AtomicU32,
     wake: Condvar,
 }
 
@@ -117,6 +127,8 @@ pub(super) fn start(job: Job) -> Arc<Pipe> {
     let pipe = Arc::new(Pipe {
         inbox: Mutex::new(Inbox { looping: job.looping, sound: job.sound, touched: Some(Instant::now()), ..Inbox::default() }),
         hardware: AtomicU8::new(0),
+        late: AtomicU64::new(0),
+        hold: AtomicU32::new(0),
         wake: Condvar::new(),
     });
     let thread_pipe = pipe.clone();
@@ -174,6 +186,10 @@ pub(super) fn us(t0: Instant) -> u128 {
 }
 
 fn run(pipe: &Pipe, job: Job) {
+    if let MediaSource::Live(live) = &job.source {
+        let input = live.input().clone();
+        return super::live::run(pipe, job, &input);
+    }
     crate::marks::mark("video.open");
     let mut d = match Decoder::open(&job) {
         Ok(d) => d,
@@ -233,7 +249,7 @@ impl Decoder {
         let duration = opened.duration;
         let picture = opened.picture;
         let ring = match (&device, &picture) {
-            (Some(device), Some(picture)) => Some(Ring::new(device.clone(), picture)?),
+            (Some(device), Some(picture)) => Some(Ring::new(device.clone(), picture, gpu::RING)?),
             _ => None,
         };
         let hardware = false;
@@ -353,7 +369,7 @@ impl Decoder {
                         pipe.hardware.store(if self.facts.hardware { 2 } else { 1 }, Ordering::Relaxed);
                         let mut s = pipe.lock();
                         let was_empty = s.frames.is_empty();
-                        s.frames.push_back(Decoded { generation, pts: epoch + read.time, picture });
+                        s.frames.push_back(Decoded { generation, pts: epoch + read.time, picture, pushed: None });
                         drop(s);
                         if first {
                             crate::marks::mark("video.first_frame");

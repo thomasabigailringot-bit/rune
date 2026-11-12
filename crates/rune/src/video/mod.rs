@@ -33,6 +33,7 @@ mod foreign;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod live;
 mod phases;
 #[cfg(target_os = "macos")]
 use macos as backend;
@@ -49,9 +50,13 @@ use unsupported as backend;
 mod windows;
 #[cfg(target_os = "windows")]
 use self::windows as backend;
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod steer;
 mod waker;
 
 use phases::{Effect, Event, Run, Stage, step};
+pub use live::{AacFrame, AccessUnit, LiveConfig, LiveSource, LiveVideo};
 pub(crate) use waker::WakerSlot;
 
 use crate::machine::Seq;
@@ -118,6 +123,15 @@ pub(crate) fn headless_clock() -> Option<f64> {
 pub enum MediaSource {
     File(PathBuf),
     Url(String),
+    /// Pictures and sound the app pushes as they arrive (see [`LiveVideo`]).
+    Live(LiveSource),
+}
+
+impl MediaSource {
+    /// A source with no end, no length and no seeking.
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
 }
 
 impl From<&str> for MediaSource {
@@ -206,6 +220,23 @@ pub struct PlayerStats {
     pub hardware: Option<bool>,
     /// Pictures decoded and waiting for their time.
     pub queued: usize,
+    /// Live: pictures the pipeline lost: skipped more than a frame and a half after their time, or
+    /// discarded because the decoder or its queue was behind. Counted in `dropped` otherwise.
+    pub late: u64,
+    /// Live: media seconds pushed and not yet shown (the newest picture pushed minus the clock),
+    /// in milliseconds.
+    pub queue_ms: f32,
+    /// Live: from `push_video` to the presentation of the last picture shown, in milliseconds.
+    pub latency_ms: f32,
+    /// Live: the clock's speed; 1 unless it is catching up or rebuilding its queue.
+    pub clock_rate: f32,
+    /// Live: access units the decoder took in before its first picture came out.
+    pub decoder_hold: u32,
+    /// Live: the sound at the device's play position minus the picture presented at that moment,
+    /// in milliseconds. The mean of the signed offsets.
+    pub av_offset_mean_ms: f32,
+    /// Live: the largest absolute offset of the same kind, in milliseconds.
+    pub av_offset_max_ms: f32,
 }
 
 /// Playback state. Video reports it as of the last frame that drew it; audio as of its last
@@ -346,9 +377,12 @@ impl Player {
     pub fn pause(&self) {
         self.send(Event::Pause);
     }
-    /// Jump to `seconds` (clamped to the clip). Keeps playing if it was playing.
+    /// Jump to `seconds` (clamped to the clip). Keeps playing if it was playing. A live video
+    /// can't seek: the call does nothing.
     pub fn seek(&self, seconds: f64) {
-        self.send(Event::Seek(seconds));
+        if !self.shared.source.is_live() {
+            self.send(Event::Seek(seconds));
+        }
     }
     /// Playback speed while playing; 1 is normal. Negative and non-finite rates are ignored.
     pub fn set_rate(&self, rate: f32) {
@@ -395,8 +429,11 @@ impl Player {
         };
         backend::live_time(&self.shared, live).unwrap_or(time)
     }
-    /// Length in seconds, once loaded.
+    /// Length in seconds, once loaded. None for a live video.
     pub fn duration(&self) -> Option<f64> {
+        if self.shared.source.is_live() {
+            return None;
+        }
         self.read().duration
     }
     /// Display size in pixels (rotation applied), once a video loads. None for audio.
