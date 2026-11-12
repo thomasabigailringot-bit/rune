@@ -483,7 +483,7 @@ impl Live {
         if let Some(device) = &self.device {
             // Pictures already queued hold the old ring's textures; they play out.
             let mut ring = Ring::new(device.clone(), &picture, RING_LIVE)?;
-            ring.follow_surface(pipe.surfaced.clone());
+            ring.follow_surface(pipe.surfaced.clone(), self.ring.as_ref());
             self.ring = Some(ring);
         }
         let frame = if picture.frame > 0.0 && picture.frame < 0.2 {

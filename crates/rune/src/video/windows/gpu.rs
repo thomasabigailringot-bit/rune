@@ -146,9 +146,12 @@ impl Ring {
         Ok(Self { device, slots: Vec::with_capacity(capacity), fences, ready, value: 0, crop: picture.crop, capacity, surfaced: None })
     }
 
-    /// Follows `surfaced`, the newest value the UI handed to the surface (`Pipe::surfaced`).
-    pub(super) fn follow_surface(&mut self, surfaced: Arc<AtomicU64>) {
-        surfaced.store(0, Ordering::Relaxed);
+    /// Follows `surfaced`, the newest value the UI handed to the surface (`Pipe::surfaced`). The
+    /// counter is shared by every ring of a player, so this ring's values go on after `after`
+    /// (the ring it replaces, whose pictures may still reach the surface): a value of the old
+    /// ring never reads as one of this ring's that was surfaced.
+    pub(super) fn follow_surface(&mut self, surfaced: Arc<AtomicU64>, after: Option<&Ring>) {
+        self.value = after.map_or(0, |ring| ring.value);
         self.surfaced = Some(surfaced);
     }
 
