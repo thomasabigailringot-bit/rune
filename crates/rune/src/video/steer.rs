@@ -7,17 +7,40 @@
 const MAX_SPEEDUP: f64 = 0.08;
 /// Slower by this much when the queue is nearly empty.
 const SLOWDOWN: f64 = 0.03;
-/// A backlog past the target by this many seconds is too far behind to catch up by speed.
+/// A backlog past the target by this many seconds, at least, is too far behind to catch up by
+/// speed. It grows with the target: a long jitter buffer is allowed a long stretch past it.
 const HARD: f64 = 1.0;
-/// Excess depth, in seconds, the clock ignores.
+/// Excess depth the clock ignores, in seconds at least, and as a fraction of the target.
 const SLACK: f64 = 0.04;
+const SLACK_PART: f64 = 0.1;
+/// The queue is nearly empty under this fraction of the target, but never under more than
+/// `FLOOR_MAX` seconds: media delivered in bursts leaves a long buffer drained far below its
+/// target between two bursts, and that is healthy.
+const FLOOR_PART: f64 = 0.4;
+const FLOOR_MAX: f64 = 0.4;
 /// Slower by this much while the queue grows to a raised target.
 const REFILL: f64 = 0.05;
 /// A speed change smaller than this isn't worth re-anchoring the clock for.
 const STEP: f64 = 0.004;
 
-/// Media waiting past the target by more than this many seconds means nothing consumes it.
-const BACKLOG_EXTRA: f64 = 2.0;
+/// Media waiting past the point where the clock would jump by more than this many seconds means
+/// nothing consumes it: the jump comes first when the window draws.
+const BACKLOG_EXTRA: f64 = 1.0;
+
+/// Excess depth over the target past which the clock jumps.
+fn hard(target: f64) -> f64 {
+    HARD.max(target)
+}
+
+/// Excess depth over the target the clock ignores.
+fn slack(target: f64) -> f64 {
+    SLACK.max(SLACK_PART * target)
+}
+
+/// Depth under which the queue is nearly empty.
+fn floor(target: f64) -> f64 {
+    (FLOOR_PART * target).min(FLOOR_MAX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Steer {
@@ -29,7 +52,7 @@ pub(crate) enum Steer {
 
 /// Whether a queue that grows to a raised target has got there.
 pub(crate) fn refilled(depth: f64, target: f64) -> bool {
-    depth >= target - SLACK
+    depth >= target - slack(target)
 }
 
 /// What the clock should do for a queue `depth` seconds deep, aiming at `target`, running at
@@ -37,14 +60,14 @@ pub(crate) fn refilled(depth: f64, target: f64) -> bool {
 /// under the target is slowed down for, however full it is.
 pub(crate) fn steer(depth: f64, target: f64, rate: f64, refill: bool) -> Steer {
     let excess = depth - target;
-    if excess > HARD {
+    if excess > hard(target) {
         return Steer::Jump;
     }
-    let wanted = if excess > SLACK {
-        1.0 + ((excess - SLACK) * 0.5).min(MAX_SPEEDUP)
+    let wanted = if excess > slack(target) {
+        1.0 + ((excess - slack(target)) * 0.5).min(MAX_SPEEDUP)
     } else if refill {
         1.0 - REFILL
-    } else if depth < target * 0.4 {
+    } else if depth < floor(target) {
         1.0 - SLOWDOWN
     } else {
         1.0
@@ -59,9 +82,10 @@ pub(crate) fn steer(depth: f64, target: f64, rate: f64, refill: bool) -> Steer {
     }
 }
 
-/// How many seconds of media may wait, at most, for a `target` delay.
+/// How many seconds of media may wait, at most, for a `target` delay: past what the clock
+/// would jump over, so that a window that draws jumps before anything is dropped here.
 pub(crate) fn backlog_limit(target: f64) -> f64 {
-    target + BACKLOG_EXTRA
+    target + hard(target) + BACKLOG_EXTRA
 }
 
 /// Where a backlog is cut.
@@ -208,7 +232,7 @@ mod tests {
                 Steer::Rate(r) => rate = r,
                 Steer::Jump => panic!("jumped at {t} s, depth {depth}"),
             }
-            if rate == 1.0 && (depth - to).abs() <= SLACK {
+            if rate == 1.0 && (depth - to).abs() <= slack(to) {
                 return (t, depth);
             }
             depth += (1.0 - rate) * dt;
@@ -222,12 +246,72 @@ mod tests {
         assert_eq!(steer(0.5, 1.0, 1.0, true), Steer::Rate(1.0 - REFILL));
         assert!(!refilled(0.5, 1.0) && refilled(0.99, 1.0));
         let (secs, depth) = retarget(0.08, 0.5);
-        assert!(secs < 15.0 && depth >= 0.5 - SLACK, "{secs} {depth}");
+        assert!(secs < 15.0 && depth >= 0.5 - slack(0.5), "{secs} {depth}");
     }
 
     #[test]
     fn a_lowered_target_drains_by_speeding_up_without_a_jump() {
         let (secs, depth) = retarget(0.5, 0.08);
-        assert!(secs < 20.0 && depth <= 0.08 + SLACK, "{secs} {depth}");
+        assert!(secs < 20.0 && depth <= 0.08 + slack(0.08), "{secs} {depth}");
+    }
+
+    /// A stream delivered in bursts of `burst` seconds every `burst` seconds, followed at 1x from
+    /// a queue that starts at the target: the queue swings between `target - burst` and `target`.
+    fn bursty(target: f64, burst: f64) {
+        let (dt, rate) = (0.01, 1.0);
+        let mut depth = target;
+        let mut next = burst;
+        let mut t = 0.0;
+        while t < 60.0 {
+            if t >= next {
+                depth += burst;
+                next += burst;
+            }
+            assert_eq!(
+                steer(depth, target, rate, false),
+                Steer::Keep,
+                "target {target} burst {burst}: t {t:.2} depth {depth:.3}"
+            );
+            depth -= rate * dt;
+            t += dt;
+        }
+    }
+
+    #[test]
+    fn bursts_do_not_move_the_clock_at_any_target() {
+        bursty(0.08, 0.03);
+        bursty(0.5, 0.25);
+        bursty(3.0, 2.0);
+        bursty(3.0, 2.5);
+    }
+
+    #[test]
+    fn thresholds_scale_with_the_target() {
+        // 0.08 s: as tuned.
+        assert_eq!(steer(1.07, 0.08, 1.0, false), Steer::Rate(1.0 + MAX_SPEEDUP));
+        assert_eq!(steer(1.09, 0.08, 1.0, false), Steer::Jump);
+        assert_eq!(steer(0.03, 0.08, 1.0, false), Steer::Rate(1.0 - SLOWDOWN));
+        assert_eq!(steer(0.05, 0.08, 1.0, false), Steer::Keep);
+        // 0.5 s.
+        assert_eq!(steer(1.49, 0.5, 1.0, false), Steer::Rate(1.0 + MAX_SPEEDUP));
+        assert_eq!(steer(1.51, 0.5, 1.0, false), Steer::Jump);
+        assert_eq!(steer(0.19, 0.5, 1.0, false), Steer::Rate(1.0 - SLOWDOWN));
+        assert_eq!(steer(0.21, 0.5, 1.0, false), Steer::Keep);
+        assert_eq!(steer(0.53, 0.5, 1.0, false), Steer::Keep);
+        // 3 s: 1.2 s of buffer is healthy, 0.3 s is nearly empty, 4 s of excess is a jump.
+        assert_eq!(steer(1.2, 3.0, 1.0, false), Steer::Keep);
+        assert_eq!(steer(1.0, 3.0, 1.0, false), Steer::Keep);
+        assert_eq!(steer(0.3, 3.0, 1.0, false), Steer::Rate(1.0 - SLOWDOWN));
+        assert_eq!(steer(3.25, 3.0, 1.0, false), Steer::Keep);
+        assert_eq!(steer(5.9, 3.0, 1.0, false), Steer::Rate(1.0 + MAX_SPEEDUP));
+        assert_eq!(steer(6.1, 3.0, 1.0, false), Steer::Jump);
+    }
+
+    #[test]
+    fn the_backlog_limit_is_past_the_jump() {
+        for target in [0.08, 0.5, 1.0, 3.0] {
+            assert!(backlog_limit(target) > target + hard(target));
+        }
+        assert!((backlog_limit(0.08) - 2.08).abs() < 1e-9);
     }
 }
