@@ -240,7 +240,7 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     if let Some(pipe) = &native.pipe {
         pipe.lock().touched = Some(now);
     }
-    if shared.source.is_live() {
+    if shared.source.is_live() && !shared.source.on_demand() {
         native.join_clock(gap, now);
     }
     native.reconcile(shared, &mut c, target, true);
@@ -366,7 +366,9 @@ impl Native {
         }
         let lead = vsync::period().as_secs_f64() / 2.0;
         if let Some(to) = c.seek.take() {
-            self.event(shared, c, Event::Seek { to });
+            // A fed video cannot seek by itself: the app restarts its run (`LiveVideo::restart`).
+            let event = if shared.source.on_demand() { Event::Restart { to } } else { Event::Seek { to } };
+            self.event(shared, c, event);
         }
         if c.playing() != self.playing {
             self.playing = c.playing();
@@ -451,8 +453,11 @@ impl Native {
             }
         };
         if jumped {
-            // The stream's timeline jumped: the clock starts again at the next picture.
-            self.event(shared, c, Event::Stalled { at: self.shown.unwrap_or(0.0) });
+            // The stream's timeline jumped: the clock starts again at the next picture. A
+            // recording waits for it in any phase: a picture of the old run may have landed first.
+            let at = self.shown.unwrap_or(0.0);
+            let event = if shared.source.on_demand() { Event::Restart { to: at } } else { Event::Stalled { at } };
+            self.event(shared, c, event);
             return;
         }
         let Some(frame) = picked else {
@@ -541,7 +546,8 @@ impl Native {
     /// The last picture showed (or the last sound played) and the decoder didn't loop. Looping
     /// turned on since starts the clip again from zero.
     fn end(&mut self, shared: &Arc<Shared>, c: &mut Control, at: f64, duration: f64) {
-        if c.observe(duration, true) {
+        // A fed video has no duration in the control: its end is its last picture.
+        if c.observe(if duration > 0.0 { duration } else { at }, true) {
             c.seek = Some(0.0);
             return;
         }

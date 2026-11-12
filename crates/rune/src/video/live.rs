@@ -10,8 +10,13 @@
 //! when the queue grows past the target, and jumps forward when it is far behind. The target can
 //! change while playing ([`LiveVideo::set_target_delay`]).
 //! [`LiveVideo::discontinuity`] starts it again at the next keyframe.
+//!
+//! With [`LiveConfig::on_demand`] the video is a recording instead (a past broadcast): units carry
+//! their media time, the clock starts at the first picture shown and runs at the player's rate,
+//! pause keeps what is queued, and the app owns back-pressure ([`LiveVideo::buffered`]) and seeking
+//! ([`LiveVideo::restart`]).
 
-use super::{MediaSource, Player};
+use super::{MediaSource, Player, steer};
 use crate::time::Instant;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -27,6 +32,10 @@ pub struct LiveConfig {
     /// Play the sound pushed with [`LiveVideo::push_audio`]. The player still starts muted:
     /// [`Player::set_muted`] turns it on.
     pub audio: bool,
+    /// A recording, not a live stream: no steering, no jumps, no cutting of what waits. Units
+    /// are stamped with their media time (90 kHz ticks from the start of the recording), and the
+    /// app starts every run with [`LiveVideo::restart`]. Off by default.
+    pub on_demand: bool,
 }
 
 impl Default for LiveConfig {
@@ -34,6 +43,7 @@ impl Default for LiveConfig {
         Self {
             target_delay: Duration::from_millis(80),
             audio: true,
+            on_demand: false,
         }
     }
 }
@@ -84,6 +94,8 @@ pub(crate) struct Queues {
     pub discontinuity: bool,
     /// The app called [`LiveVideo::finish`].
     pub closed: bool,
+    /// An on-demand run starts here (seconds): pictures and sound before it are not kept.
+    pub restart_at: Option<f64>,
 }
 
 /// What the app pushed, for the decoder thread to take.
@@ -100,6 +112,8 @@ pub(crate) struct LiveInput {
     origin: AtomicI64,
     /// Access units pushed in all.
     pushed: AtomicU64,
+    /// The recording's length in microseconds; `u64::MAX` when not known.
+    duration: AtomicU64,
 }
 
 impl LiveInput {
@@ -110,8 +124,10 @@ impl LiveInput {
             queues: Mutex::default(),
             ready: Condvar::new(),
             newest: AtomicI64::new(i64::MIN),
-            origin: AtomicI64::new(i64::MIN),
+            // A recording's stamps are its media time: its seconds start at 0.
+            origin: AtomicI64::new(if config.on_demand { 0 } else { i64::MIN }),
             pushed: AtomicU64::new(0),
+            duration: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -146,6 +162,7 @@ impl LiveInput {
             audio: std::mem::take(&mut q.audio),
             discontinuity: std::mem::take(&mut q.discontinuity),
             closed: q.closed,
+            restart_at: q.restart_at.take(),
         }
     }
 
@@ -167,6 +184,14 @@ impl LiveSource {
     pub(crate) fn input(&self) -> &Arc<LiveInput> {
         &self.input
     }
+
+    /// The recording's length, if the app gave it ([`LiveVideo::set_duration`]).
+    pub(crate) fn duration(&self) -> Option<f64> {
+        match self.input.duration.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            us => Some(us as f64 / 1e6),
+        }
+    }
 }
 
 impl PartialEq for LiveSource {
@@ -184,8 +209,8 @@ impl std::fmt::Debug for LiveSource {
 }
 
 /// A live video: a [`Player`] (draw it with `el().video(&live, fit)`; it dereferences to one)
-/// whose pictures and sound the app pushes. It has no duration, no seeking and no looping, and
-/// opens when the first keyframe arrives.
+/// whose pictures and sound the app pushes. It has no seeking and no looping, no duration unless
+/// the app sets one for a recording, and opens when the first keyframe arrives.
 #[derive(Clone)]
 pub struct LiveVideo {
     player: Player,
@@ -252,6 +277,41 @@ impl LiveVideo {
     pub fn finish(&self) {
         self.input.queues.lock().unwrap().closed = true;
         self.input.ready.notify_all();
+    }
+
+    /// On-demand only: starts a new run at `at` (a seek, a quality switch, the first run). Drops
+    /// what is queued and in flight, sound included, reopens the input after [`LiveVideo::finish`],
+    /// and sets the time base so that [`Player::time`] reports `at` and then follows the pictures.
+    /// The app pushes units from a keyframe at or before `at`; pictures and sound before `at` are
+    /// decoded and not shown. The clock starts at the first picture shown, playing or not (a
+    /// paused video shows it and holds). Does nothing for a live video.
+    pub fn restart(&self, at: Duration) {
+        if !self.input.config.on_demand {
+            return;
+        }
+        let seconds = at.as_secs_f64();
+        let mut q = self.input.queues.lock().unwrap();
+        q.video.clear();
+        q.audio.clear();
+        q.discontinuity = true;
+        q.closed = false;
+        q.restart_at = Some(seconds);
+        drop(q);
+        self.input.newest.store(i64::MIN, Ordering::Release);
+        self.player.send(super::Event::Seek(seconds));
+        self.input.ready.notify_all();
+    }
+
+    /// The recording's length, so that [`Player::duration`] answers. `None` for unknown.
+    pub fn set_duration(&self, duration: Option<Duration>) {
+        let us = duration.map_or(u64::MAX, |d| d.as_micros().min(u128::from(u64::MAX - 1)) as u64);
+        self.input.duration.store(us, Ordering::Relaxed);
+    }
+
+    /// On-demand: media pushed and not yet shown (the newest unit pushed minus [`Player::time`]),
+    /// so the app can stop reading while enough is queued. Pausing does not drain it.
+    pub fn buffered(&self) -> Duration {
+        Duration::from_secs_f64(steer::buffered(self.input.newest_seconds(), self.player.time()))
     }
 
     /// The configuration this video was made with, with the delay it aims at now.

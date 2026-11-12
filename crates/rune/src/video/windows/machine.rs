@@ -67,6 +67,9 @@ pub(super) enum Event {
     /// Hold the picture on screen, at `at`.
     Pause { at: f64 },
     Seek { to: f64 },
+    /// A fed recording starts a new run at `to`: the next picture shown (at or after it) lands the
+    /// clock there. The decoder's pictures keep their generation: its input was flushed instead.
+    Restart { to: f64 },
     Rate { target: Instant, rate: f64 },
     /// Playing, with no picture due and the decoder behind: hold the clock at `at`.
     Stalled { at: f64 },
@@ -164,6 +167,26 @@ pub(super) fn step(phase: &mut Phase, event: Event) -> Effects<Effect> {
         (P::Paused { .. } | P::Ended { .. }, Event::Seek { to }) => {
             *phase = P::Buffering { at: to, play: false };
             Effects::one(Effect::Seek { to })
+        }
+        (P::Idle { .. }, Event::Restart { to }) => {
+            *phase = P::Idle { at: to };
+            Effects::none()
+        }
+        (P::Opening { play, .. }, Event::Restart { to }) => {
+            *phase = P::Opening { at: to, play };
+            Effects::none()
+        }
+        (P::Buffering { play, .. }, Event::Restart { to }) => {
+            *phase = P::Buffering { at: to, play };
+            Effects::none()
+        }
+        (P::Playing { .. }, Event::Restart { to }) => {
+            *phase = P::Buffering { at: to, play: true };
+            Effects::one(Effect::Clock(None))
+        }
+        (P::Paused { .. } | P::Ended { .. }, Event::Restart { to }) => {
+            *phase = P::Buffering { at: to, play: false };
+            Effects::none()
         }
         (P::Playing { clock }, Event::Rate { target, rate }) => {
             let clock = Anchor { at: target, pos: clock.position(target), rate };

@@ -10,6 +10,11 @@
 //! sound stays on the stream behind a covered or minimized window. Decoded pictures wait for the UI (`Native::show`). While nothing draws (no
 //! frame for `REST`) no picture is decoded at all: the access units wait from the last keyframe
 //! before the clock, and decoding restarts there when a frame draws again.
+//!
+//! A recording (`LiveConfig::on_demand`) is not steered: the UI owns its clock (it starts at the
+//! first picture shown and pause stops it), nothing is cut or rested, the units wait as long as
+//! the app keeps them queued, and the thread outlives the end of the stream so that a restart can
+//! play it again.
 
 mod aac;
 mod h264;
@@ -71,6 +76,8 @@ pub(super) fn run(pipe: &Pipe, job: Job, input: &Arc<LiveInput>) {
 
 struct Live {
     input: Arc<LiveInput>,
+    /// A recording: see the module's comment.
+    on_demand: bool,
     lib: &'static Library,
     device: Option<Arc<Device>>,
     video: h264::Video,
@@ -125,6 +132,9 @@ impl Live {
         }
         job.clock.set_varispeed(true);
         Ok(Self {
+            on_demand: input.config.on_demand,
+            // A recording's stamps are its media time: seconds start at 0 (see `LiveInput`).
+            origin: input.config.on_demand.then_some(0),
             input,
             lib,
             device,
@@ -133,7 +143,6 @@ impl Live {
             audio: None,
             output: None,
             facts: None,
-            origin: None,
             synced: false,
             pending: VecDeque::new(),
             backlog: VecDeque::new(),
@@ -163,11 +172,13 @@ impl Live {
             if queues.discontinuity {
                 self.backlog.clear();
                 self.restart(pipe);
+                // A recording's new run decodes from its keyframe and shows from where it was asked.
+                self.skip_until = queues.restart_at;
             }
             // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
             // (`target_delay`) waits here as access units, which cost far less than pictures.
             self.backlog.extend(queues.video);
-            if !self.resting {
+            if !self.resting && !self.on_demand {
                 self.bound_backlog(pipe);
             }
             // Sound first: the first picture's facts say whether there is sound to play.
@@ -191,9 +202,19 @@ impl Live {
                 std::thread::sleep(PATIENCE);
             } else if queues.closed && self.input.pushed() > 0 {
                 let generation = job.generation;
-                pipe.lock().ended = Some(generation);
-                (job.notify)();
-                return Ok(());
+                let mut s = pipe.lock();
+                let told = s.ended == Some(generation);
+                s.ended = Some(generation);
+                drop(s);
+                if !self.on_demand {
+                    (job.notify)();
+                    return Ok(());
+                }
+                // A recording stays to be restarted: tell once, then wait.
+                if !told {
+                    (job.notify)();
+                }
+                std::thread::sleep(PATIENCE);
             }
         }
     }
@@ -239,6 +260,9 @@ impl Live {
     /// the queue runs dry until the target is queued again, and restarts it after a
     /// discontinuity. The UI takes the clock as it is when it draws again.
     fn follow(&mut self, pipe: &Pipe, idle: Duration, play: bool) {
+        if self.on_demand {
+            return;
+        }
         let hidden = idle > UNDRAWN;
         if self.reanchor {
             self.rejoin(pipe, hidden);
@@ -313,6 +337,9 @@ impl Live {
     /// before the clock are decoded but not kept: the first picture is the one at the clock,
     /// at most a keyframe interval of decoding after the frame, with the sound untouched.
     fn rest(&mut self, pipe: &Pipe, idle: Duration) -> bool {
+        if self.on_demand {
+            return false;
+        }
         let anchor = self.clock.get();
         let Some(anchor) = anchor.filter(|_| idle >= REST) else {
             if std::mem::take(&mut self.resting) {
@@ -408,13 +435,20 @@ impl Live {
         }
         self.synced = false;
         self.skip_until = None;
-        self.reanchor = true;
-        self.origin = None;
-        self.input.set_origin(None);
         self.pending.clear();
+        if self.on_demand {
+            self.sound_next = 0.0;
+        } else {
+            self.reanchor = true;
+            self.origin = None;
+            self.input.set_origin(None);
+        }
         let mut s = pipe.lock();
         s.frames.clear();
         s.jump = true;
+        if self.on_demand {
+            s.ended = None;
+        }
     }
 
     fn sound_frame(&mut self, frame: Pushed<AacFrame>, wanted: bool) {
@@ -452,7 +486,9 @@ impl Live {
             self.sound_next = at + (values.len() / channels) as f64 / rate;
             if let Some(output) = &self.output {
                 output.push_pcm(values, at, self.skip_until.unwrap_or(f64::NEG_INFINITY));
-                output.trim(f64::NEG_INFINITY, steer::backlog_limit(self.input.target_seconds()));
+                if !self.on_demand {
+                    output.trim(f64::NEG_INFINITY, steer::backlog_limit(self.input.target_seconds()));
+                }
             }
         }
     }

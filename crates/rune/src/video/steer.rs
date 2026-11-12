@@ -130,6 +130,12 @@ pub(crate) fn backlog_cut(
     Some(Cut { drop: at, floor })
 }
 
+/// Seconds of an on-demand video's media that wait ahead of where it is: the newest unit pushed
+/// (None: nothing yet) minus the position. The app reads this to stop reading ahead.
+pub(crate) fn buffered(newest: Option<f64>, position: f64) -> f64 {
+    newest.map_or(0.0, |newest| (newest - position).max(0.0))
+}
+
 /// A running clock, as the follower sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct View {
@@ -522,6 +528,16 @@ mod tests {
         assert_eq!(steer(3.25, 3.0, 1.0, false), Steer::Keep);
         assert_eq!(steer(5.9, 3.0, 1.0, false), Steer::Rate(1.0 + MAX_SPEEDUP));
         assert_eq!(steer(6.1, 3.0, 1.0, false), Steer::Jump);
+    }
+
+    #[test]
+    fn buffered_is_the_media_ahead_of_the_position() {
+        assert_eq!(buffered(None, 12.0), 0.0);
+        assert_eq!(buffered(Some(32.0), 12.0), 20.0);
+        // A position past the newest unit (a stall) holds nothing.
+        assert_eq!(buffered(Some(10.0), 12.0), 0.0);
+        // A restart at a time the newest unit has not reached yet.
+        assert_eq!(buffered(Some(61.5), 60.0), 1.5);
     }
 
     #[test]

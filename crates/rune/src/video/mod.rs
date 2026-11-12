@@ -128,9 +128,15 @@ pub enum MediaSource {
 }
 
 impl MediaSource {
-    /// A source with no end, no length and no seeking.
+    /// A source the app feeds: no end known to the decoder, and no seeking by the player.
     fn is_live(&self) -> bool {
         matches!(self, Self::Live(_))
+    }
+
+    /// A fed source that is a recording ([`LiveConfig::on_demand`]): its clock is the player's.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn on_demand(&self) -> bool {
+        matches!(self, Self::Live(live) if live.input().config.on_demand)
     }
 }
 
@@ -429,10 +435,11 @@ impl Player {
         };
         backend::live_time(&self.shared, live).unwrap_or(time)
     }
-    /// Length in seconds, once loaded. None for a live video.
+    /// Length in seconds, once loaded. None for a live video, and for a fed recording until
+    /// [`LiveVideo::set_duration`].
     pub fn duration(&self) -> Option<f64> {
-        if self.shared.source.is_live() {
-            return None;
+        if let MediaSource::Live(live) = &self.shared.source {
+            return live.duration();
         }
         self.read().duration
     }
