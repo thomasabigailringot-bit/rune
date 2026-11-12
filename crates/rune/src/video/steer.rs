@@ -128,9 +128,58 @@ pub(crate) fn backlog_cut(
     Some(Cut { drop: at, floor })
 }
 
+/// The memory of a clock that follows a stream: the last target it steered to, and whether the
+/// queue still grows to a target raised since. One follower steers one clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Follower {
+    seen: Option<f64>,
+    refill: bool,
+}
+
+impl Follower {
+    /// [`steer`] for the clock at `rate`. A raised target is reached by slowing the clock down; a
+    /// lowered one by the usual speedup.
+    pub(crate) fn step(&mut self, depth: f64, target: f64, rate: f64) -> Steer {
+        match self.seen.replace(target) {
+            Some(was) if target > was => self.refill = true,
+            Some(was) if target < was => self.refill = false,
+            _ => {}
+        }
+        if self.refill && refilled(depth, target) {
+            self.refill = false;
+        }
+        steer(depth, target, rate, self.refill)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_follower_slows_for_a_raised_target_until_it_is_reached() {
+        let mut f = Follower::default();
+        assert_eq!(f.step(0.1, 0.1, 1.0), Steer::Keep);
+        assert_eq!(f.step(0.1, 0.5, 1.0), Steer::Rate(1.0 - REFILL));
+        assert_eq!(f.step(0.3, 0.5, 1.0 - REFILL), Steer::Keep);
+        assert_eq!(f.step(0.5, 0.5, 1.0 - REFILL), Steer::Rate(1.0));
+        assert_eq!(f.step(0.5, 0.5, 1.0), Steer::Keep);
+    }
+
+    #[test]
+    fn a_follower_drops_the_refill_when_the_target_is_lowered() {
+        let mut f = Follower::default();
+        f.step(0.1, 0.1, 1.0);
+        f.step(0.1, 0.5, 1.0);
+        assert!(matches!(f.step(0.4, 0.2, 1.0 - REFILL), Steer::Rate(r) if r > 1.0));
+    }
+
+    #[test]
+    fn a_follower_settles_a_leftover_rate_with_nobody_drawing() {
+        // The rate left at 1.012 when the window stopped drawing returns to exactly 1.
+        let mut f = Follower::default();
+        assert_eq!(f.step(0.5, 0.5, 1.012), Steer::Rate(1.0));
+    }
 
     #[test]
     fn keeps_speed_near_the_target() {

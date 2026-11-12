@@ -30,6 +30,11 @@ use std::time::Duration;
 /// A muted clip undrawn this long picks up at its picture when drawn again, rather than
 /// skipping what played while nobody watched.
 const RESUME_GAP: Duration = Duration::from_millis(250);
+/// A live clip undrawn this long is hidden (covered, minimized): its decoder steers the clock
+/// itself, and the first frame drawn after it waits for a picture at the clock.
+const LIVE_IDLE: Duration = Duration::from_millis(100);
+/// A live clip that came back waits this long for its first picture before it counts as a stall.
+const LIVE_RETURN: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub(crate) struct Native {
@@ -54,10 +59,10 @@ pub(crate) struct Native {
     /// (`RUNE_VIDEO_LOG`).
     opened: Option<Instant>,
     counts: Counts,
-    /// Live: the target delay the clock was last steered to, and whether the queue still grows
-    /// to a target raised since.
-    target_seen: Option<f64>,
-    refill: bool,
+    /// Live: when the frame that draws the clip came back after a gap. The decoder kept the clock
+    /// on the stream meanwhile, and no picture is due until the decoder has caught up to it:
+    /// that is no stall, for a while.
+    returning: Option<Instant>,
     /// Told of each picture that reaches the surface (`Player::set_picture_observer`).
     observer: Option<Arc<dyn Fn(f64, Instant) + Send + Sync>>,
 }
@@ -69,10 +74,8 @@ struct Counts {
     dropped: u64,
     late: u64,
     stalls: u64,
-    /// Live: the last picture's push-to-presentation time in milliseconds, and the queue's depth
-    /// in seconds when the clock was last steered.
+    /// Live: the last picture's push-to-presentation time in milliseconds.
     latency_ms: f32,
-    depth: f64,
     /// Live: the offsets between the sound at the device and the picture presented, summed, counted
     /// and the largest, in seconds.
     sync_sum: f64,
@@ -173,6 +176,13 @@ pub(super) fn preload(shared: &Arc<Shared>) {
     }
 }
 
+/// Live: how deep the queue is at the clock now (seconds); 0 for anything else.
+fn live_depth(native: &Native, shared: &Shared) -> f64 {
+    let MediaSource::Live(source) = &shared.source else { return 0.0 };
+    let (Some(clock), Some(newest)) = (native.clock.get(), source.input().newest_seconds()) else { return 0.0 };
+    newest - clock.position(Instant::now())
+}
+
 pub(super) fn stats(shared: &Shared) -> PlayerStats {
     let native = shared.native.lock().unwrap();
     let (silent, played) = native.clock.silence();
@@ -181,12 +191,10 @@ pub(super) fn stats(shared: &Shared) -> PlayerStats {
         dropped: native.counts.dropped,
         late: native.counts.late + native.pipe.as_ref().map_or(0, |p| p.late.load(Ordering::Relaxed)),
         stalls: native.counts.stalls,
-        queue_ms: (native.counts.depth * 1000.0) as f32,
+        queue_ms: (live_depth(&native, shared) * 1000.0) as f32,
         latency_ms: native.counts.latency_ms,
-        clock_rate: match native.phase {
-            Phase::Playing { clock } => clock.rate as f32,
-            _ => 1.0,
-        },
+        // The clock itself: a live clip's decoder steers it while nothing draws.
+        clock_rate: native.clock.get().map_or(1.0, |clock| clock.rate as f32),
         decoder_hold: native.pipe.as_ref().map_or(0, |p| p.hold.load(Ordering::Relaxed)),
         av_offset_mean_ms: if native.counts.sync_n > 0 { (native.counts.sync_sum / native.counts.sync_n as f64 * 1000.0) as f32 } else { 0.0 },
         av_offset_max_ms: (native.counts.sync_max * 1000.0) as f32,
@@ -232,6 +240,9 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     if let Some(pipe) = &native.pipe {
         pipe.lock().touched = Some(now);
     }
+    if shared.source.is_live() {
+        native.join_clock(gap, now);
+    }
     native.reconcile(shared, &mut c, target, true);
     if c.failed() {
         native.due = None;
@@ -241,6 +252,7 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     if let (Phase::Playing { .. }, Some(gap), Some(at)) = (native.phase, gap, native.shown)
         && gap > RESUME_GAP
         && !native.sounding(&c)
+        && !shared.source.is_live()
     {
         native.event(shared, &c, Event::Resumed { target, at, lead });
     }
@@ -251,7 +263,6 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     // pulled a refresh late is a picture skipped.
     if shared.source.is_live() {
         due = None;
-        native.steer(shared, &c, target);
     }
     native.due = due;
     let cost = now.elapsed().as_nanos();
@@ -452,7 +463,11 @@ impl Native {
         if let Some(pushed) = frame.pushed {
             self.counts.latency_ms = target.saturating_duration_since(pushed).as_secs_f32() * 1000.0;
         }
+        if let Pic::Gpu(_, value) = &frame.picture {
+            pipe.surfaced.fetch_max(*value, Ordering::Release);
+        }
         self.put(c, surface, frame);
+        self.returning = None;
         self.counts.shown += 1;
         if let Phase::Playing { .. } = self.phase
             && let Some(heard) = self.clock.heard_at(target)
@@ -482,39 +497,15 @@ impl Native {
         }
     }
 
-    /// A live video's clock follows its stream: faster for a backlog, slower for a thin queue, and
-    /// forward when it is far behind (`steer`).
-    fn steer(&mut self, shared: &Arc<Shared>, c: &Control, target: Instant) {
-        let MediaSource::Live(source) = &shared.source else { return };
-        let Phase::Playing { clock } = self.phase else { return };
-        let Some(newest) = source.input().newest_seconds() else { return };
-        let wanted = source.input().target_seconds();
-        let depth = newest - clock.position(target);
-        self.counts.depth = depth;
-        // A raised target is reached by slowing the clock; a lowered one by the usual speedup.
-        match self.target_seen.replace(wanted) {
-            Some(was) if wanted > was => self.refill = true,
-            Some(was) if wanted < was => self.refill = false,
-            _ => {}
+    /// A live clip's clock is steered by its decoder thread (`live`), drawn or not: the phase
+    /// takes the clock as it is now, and a frame after a gap notes that it came back.
+    fn join_clock(&mut self, gap: Option<Duration>, now: Instant) {
+        let Phase::Playing { .. } = self.phase else { return };
+        if let Some(clock) = self.clock.get() {
+            self.phase = Phase::Playing { clock };
         }
-        if self.refill && super::steer::refilled(depth, wanted) {
-            self.refill = false;
-        }
-        let lead = vsync::period().as_secs_f64() / 2.0;
-        match super::steer::steer(depth, wanted, clock.rate, self.refill) {
-            super::steer::Steer::Keep => {}
-            super::steer::Steer::Rate(rate) => self.event(shared, c, Event::Rate { target, rate }),
-            super::steer::Steer::Jump => {
-                if decoder::logging() {
-                    decoder::log!("live: {depth:.2} s behind, jumping to {wanted:.2} s");
-                }
-                // The decoder skips to the same time: decoding what the jump passed over
-                // would only keep it behind.
-                if let Some(pipe) = &self.pipe {
-                    pipe.lock().skip_to = Some(newest - wanted);
-                }
-                self.event(shared, c, Event::Resumed { target, at: newest - wanted - lead, lead });
-            }
+        if gap.is_some_and(|g| g > LIVE_IDLE) {
+            self.returning = Some(now);
         }
     }
 
@@ -537,7 +528,7 @@ impl Native {
             if pos >= end.max(shown + frame) {
                 self.end(shared, c, shown, duration);
             }
-        } else if pos > shown + frame * 2.0 + 0.1 {
+        } else if pos > shown + frame * 2.0 + 0.1 && !self.returning.is_some_and(|at| at.elapsed() < LIVE_RETURN) {
             self.counts.stalls += 1;
             self.event(shared, c, Event::Stalled { at: shown + frame });
         }

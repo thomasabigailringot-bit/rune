@@ -47,8 +47,6 @@ pub(super) struct Inbox {
     pub ended: Option<u32>,
     /// Live: the stream's timeline jumped; the clock starts again at the next picture.
     pub jump: bool,
-    /// Live: the clock jumped forward to this time (seconds); earlier pictures have no use.
-    pub skip_to: Option<f64>,
 }
 
 pub(super) enum News {
@@ -93,6 +91,8 @@ pub(super) struct Pipe {
     /// Live: pictures the pipeline lost, and the access units the decoder took in before its
     /// first picture.
     pub late: AtomicU64,
+    /// Live: the newest GPU picture value the UI handed to the surface (`Ring::follow_surface`).
+    pub surfaced: Arc<AtomicU64>,
     pub hold: AtomicU32,
     wake: Condvar,
 }
@@ -130,6 +130,7 @@ pub(super) fn start(job: Job) -> Arc<Pipe> {
         inbox: Mutex::new(Inbox { looping: job.looping, sound: job.sound, touched: Some(Instant::now()), ..Inbox::default() }),
         hardware: AtomicU8::new(0),
         late: AtomicU64::new(0),
+        surfaced: Arc::new(AtomicU64::new(0)),
         hold: AtomicU32::new(0),
         wake: Condvar::new(),
     });

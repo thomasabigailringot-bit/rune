@@ -48,6 +48,16 @@ impl Clock {
         *self.anchor.lock().unwrap() = anchor;
         self.changed.notify_all();
     }
+    /// Changes the anchor of a clock that runs, atomically: nothing happens if it stopped since
+    /// the caller read it (a thread that steers a live clock must not start it again).
+    pub(super) fn update(&self, change: impl FnOnce(Anchor) -> Anchor) {
+        let mut anchor = self.anchor.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(a) = *anchor {
+            *anchor = Some(change(a));
+            drop(anchor);
+            self.changed.notify_all();
+        }
+    }
     /// Frames of silence written for gaps, and frames written in all, while the clock ran.
     pub(super) fn silence(&self) -> (u64, u64) {
         (self.silent.load(Ordering::Relaxed), self.played.load(Ordering::Relaxed))

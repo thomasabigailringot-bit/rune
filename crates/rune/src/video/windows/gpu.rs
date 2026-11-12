@@ -6,6 +6,7 @@
 
 use super::mf::{self, Picture};
 use crate::native_surface::windows::{DecodedPlanes, VideoFences, presenting_device};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
@@ -122,6 +123,10 @@ pub(super) struct Ring {
     crop: (u32, u32, u32, u32),
     /// How many pictures the ring holds at most.
     capacity: usize,
+    /// The newest picture value handed to the surface, when the ring is told. A picture newer than
+    /// that never reached the surface (dropped in the queue), so no draw will ever signal its
+    /// release: its slot is free as soon as no handle holds it.
+    surfaced: Option<Arc<AtomicU64>>,
 }
 
 impl Ring {
@@ -138,7 +143,13 @@ impl Ring {
             opened.map_err(|e| format!("open fence: {}", e.message()))?;
             (Arc::new(VideoFences { ready: ready12, release }), ready.ok_or("open fence")?)
         };
-        Ok(Self { device, slots: Vec::with_capacity(capacity), fences, ready, value: 0, crop: picture.crop, capacity })
+        Ok(Self { device, slots: Vec::with_capacity(capacity), fences, ready, value: 0, crop: picture.crop, capacity, surfaced: None })
+    }
+
+    /// Follows `surfaced`, the newest value the UI handed to the surface (`Pipe::surfaced`).
+    pub(super) fn follow_surface(&mut self, surfaced: Arc<AtomicU64>) {
+        surfaced.store(0, Ordering::Relaxed);
+        self.surfaced = Some(surfaced);
     }
 
     /// Whether a picture could be written now: a slot is free, or there's room for another.
@@ -150,7 +161,8 @@ impl Ring {
     fn reusable(&self) -> Option<usize> {
         // SAFETY: a plain read of the fence's value.
         let released = unsafe { self.fences.release.GetCompletedValue() };
-        self.slots.iter().position(|s| Arc::strong_count(&s.planes) == 1 && (s.value == 0 || released >= s.value))
+        let surfaced = self.surfaced.as_ref().map_or(u64::MAX, |s| s.load(Ordering::Acquire));
+        self.slots.iter().position(|s| Arc::strong_count(&s.planes) == 1 && (s.value == 0 || released >= s.value || s.value > surfaced))
     }
 
     /// A free slot, made when every made one is busy and the ring isn't full: a clip that shows

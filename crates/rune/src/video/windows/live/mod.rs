@@ -4,13 +4,17 @@
 //! the same pipe a clip's decoder uses. No container, no source reader and no probe: a picture is
 //! on the queue as soon as the transform gives it.
 //!
-//! The UI thread owns the clock (`crate::video::steer` says how it follows the stream); this
-//! thread only stamps what it decodes.
+//! This thread owns the clock's speed (`crate::video::steer` says how it follows the stream) and
+//! steers it whether or not a window draws, so the sound stays on the stream behind a covered or
+//! minimized window. Decoded pictures wait for the UI (`Native::show`). While nothing draws (no
+//! frame for `REST`) no picture is decoded at all: the access units wait from the last keyframe
+//! before the clock, and decoding restarts there when a frame draws again.
 
 mod aac;
 mod h264;
 
 use super::audio::{self, Output};
+use super::machine::Anchor;
 use super::decoder::{Decoded, Facts, Job, News, Pic, Pipe, log, logging, us};
 use super::gpu::{self, Device, RING_LIVE, Ring};
 use super::mf::{self, Library};
@@ -33,6 +37,12 @@ const MAX_QUEUE: usize = 40;
 /// Decoded pictures kept ahead of the clock: enough to ride out a slow wake of this thread,
 /// few enough to leave the texture ring room.
 const AHEAD: usize = 8;
+/// A live clip undrawn this long is at rest: its decoder decodes no pictures, and its clock is
+/// steered here. (Shorter hitches of the UI are not worth dropping the pictures for.)
+const REST: Duration = Duration::from_millis(500);
+/// A clip's clock is steered here once no frame has drawn it for this long; the frame that
+/// draws it steers it otherwise.
+const UNDRAWN: Duration = Duration::from_millis(100);
 /// How long the thread waits for something to arrive before it looks at the pipe again.
 const PATIENCE: Duration = Duration::from_millis(4);
 
@@ -80,6 +90,12 @@ struct Live {
     /// Where the next sound block starts, if the transform stamps none.
     sound_next: f64,
     clock: Arc<audio::Clock>,
+    /// Steers the clock.
+    follower: steer::Follower,
+    /// At rest: no frame draws the clip (`REST`), and no picture is decoded.
+    resting: bool,
+    /// The stream's timeline jumped while nothing drew: the clock starts again on the new one.
+    reanchor: bool,
 }
 
 impl Live {
@@ -122,17 +138,20 @@ impl Live {
             sound_failed: false,
             sound_next: 0.0,
             clock: job.clock.clone(),
+            follower: steer::Follower::default(),
+            resting: false,
+            reanchor: false,
         })
     }
 
     fn work(&mut self, pipe: &Pipe, job: &Job) -> Result<(), String> {
         loop {
-            let (sound, skip) = {
-                let mut s = pipe.lock();
+            let (sound, idle) = {
+                let s = pipe.lock();
                 if s.stop {
                     return Ok(());
                 }
-                (s.sound, s.skip_to.take())
+                (s.sound, s.touched.map_or(Duration::ZERO, |t| t.elapsed()))
             };
             self.follow_sound(sound);
             let queues = self.input.take(PATIENCE);
@@ -143,15 +162,16 @@ impl Live {
             // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
             // (`target_delay`) waits here as access units, which cost far less than pictures.
             self.backlog.extend(queues.video);
-            self.bound_backlog(pipe);
+            if !self.resting {
+                self.bound_backlog(pipe);
+            }
             // Sound first: the first picture's facts say whether there is sound to play.
             for frame in queues.audio {
                 self.sound_frame(frame, sound.is_some());
             }
-            if let Some(to) = skip {
-                self.skip(to, pipe);
-            }
-            while pipe.lock().frames.len() < AHEAD {
+            self.follow(pipe, idle);
+            let resting = self.rest(pipe, idle);
+            while !resting && pipe.lock().frames.len() < AHEAD {
                 let Some(unit) = self.backlog.pop_front() else { break };
                 self.video_unit(unit, pipe, job)?;
             }
@@ -199,6 +219,100 @@ impl Live {
         if pipe.late.fetch_add(lost, Ordering::Relaxed) == 0 && logging() {
             log!("live: {lost} pictures dropped, more than {:.1} s of video was waiting", steer::backlog_limit(target));
         }
+    }
+
+    /// Steers the clock: faster for a backlog, slower for a thin queue, forward when it is far
+    /// behind. The clock runs only while the UI shows the clip (`Native`); from then on this
+    /// thread is the only one that changes its speed.
+    fn follow(&mut self, pipe: &Pipe, idle: Duration) {
+        if self.reanchor {
+            self.rejoin(pipe, idle);
+            return;
+        }
+        let Some(clock) = self.clock.get() else { return };
+        let Some(newest) = self.input.newest_seconds() else { return };
+        let wanted = self.input.target_seconds();
+        let now = Instant::now();
+        let depth = newest - clock.position(now);
+        match self.follower.step(depth, wanted, clock.rate) {
+            steer::Steer::Keep => {}
+            steer::Steer::Rate(rate) => {
+                self.clock.update(|a| Anchor { at: now, pos: a.position(now), rate });
+            }
+            steer::Steer::Jump => {
+                if logging() {
+                    log!("live: {depth:.2} s behind, jumping to {wanted:.2} s{}", if idle > UNDRAWN { " (undrawn)" } else { "" });
+                }
+                let to = newest - wanted;
+                self.clock.update(|a| Anchor { at: now, pos: to, rate: a.rate });
+                self.skip(to, pipe);
+            }
+        }
+    }
+
+    /// After a discontinuity nobody drew: the clock starts again on the new timeline, at the
+    /// target behind the stream, so the sound goes on. A frame that draws takes the discontinuity
+    /// itself (`Native::show`) and shows the first picture.
+    fn rejoin(&mut self, pipe: &Pipe, idle: Duration) {
+        if self.origin.is_none()
+            && let Some(first) = self.backlog.front()
+        {
+            self.seconds(first.item.pts);
+        }
+        let Some(newest) = self.input.newest_seconds() else { return };
+        let mut s = pipe.lock();
+        if !s.jump {
+            self.reanchor = false;
+        } else if idle > UNDRAWN {
+            s.jump = false;
+            drop(s);
+            self.reanchor = false;
+            let (now, to) = (Instant::now(), newest - self.input.target_seconds());
+            self.clock.update(|_| Anchor { at: now, pos: to, rate: 1.0 });
+            self.skip_until = Some(to);
+            self.follower = steer::Follower::default();
+            if logging() {
+                log!("live: new timeline while undrawn, clock restarts at {to:.2} s");
+            }
+        }
+    }
+
+    /// Nobody draws the clip: no pictures are decoded (nobody would see them) and the access
+    /// units kept start at the last keyframe at or before the clock. Returns whether it is at
+    /// rest. Decoding restarts from that keyframe when a frame draws again, and the pictures
+    /// before the clock are decoded but not kept: the first picture is the one at the clock,
+    /// at most a keyframe interval of decoding after the frame, with the sound untouched.
+    fn rest(&mut self, pipe: &Pipe, idle: Duration) -> bool {
+        let anchor = self.clock.get();
+        let Some(anchor) = anchor.filter(|_| idle >= REST) else {
+            if std::mem::take(&mut self.resting) {
+                if let Some(a) = anchor {
+                    self.skip_until = Some(a.position(Instant::now()));
+                }
+                if logging() {
+                    log!("live: drawn again, decoding from the keyframe before the clock");
+                }
+            }
+            return false;
+        };
+        if !self.resting {
+            self.resting = true;
+            self.video.flush();
+            self.pending.clear();
+            self.synced = false;
+            pipe.lock().frames.clear();
+            if logging() {
+                log!("live: undrawn for {idle:?}, no pictures decoded");
+            }
+        }
+        if let Some(origin) = self.origin {
+            let pos = anchor.position(Instant::now());
+            let reachable = |u: &Pushed<AccessUnit>| u.item.keyframe && (u.item.pts - origin) as f64 / 90_000.0 <= pos;
+            if let Some(at) = self.backlog.iter().rposition(reachable) {
+                self.backlog.drain(..at);
+            }
+        }
+        true
     }
 
     /// The clock jumped forward to `to` seconds: no picture before it is wanted.
@@ -264,6 +378,7 @@ impl Live {
         }
         self.synced = false;
         self.skip_until = None;
+        self.reanchor = true;
         self.origin = None;
         self.input.set_origin(None);
         self.pending.clear();
@@ -367,7 +482,9 @@ impl Live {
             .ok_or("the decoder gave no picture size")?;
         if let Some(device) = &self.device {
             // Pictures already queued hold the old ring's textures; they play out.
-            self.ring = Some(Ring::new(device.clone(), &picture, RING_LIVE)?);
+            let mut ring = Ring::new(device.clone(), &picture, RING_LIVE)?;
+            ring.follow_surface(pipe.surfaced.clone());
+            self.ring = Some(ring);
         }
         let frame = if picture.frame > 0.0 && picture.frame < 0.2 {
             picture.frame
