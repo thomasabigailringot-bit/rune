@@ -29,6 +29,9 @@ use windows::core::Interface;
 /// Decoded pictures waiting for their time past which the oldest is dropped: the UI isn't drawing
 /// (covered, say) and the stream must go on.
 const MAX_QUEUE: usize = 40;
+/// Decoded pictures kept ahead of the clock: enough to ride out a slow wake of this thread,
+/// few enough to leave the texture ring room.
+const AHEAD: usize = 8;
 /// How long the thread waits for something to arrive before it looks at the pipe again.
 const PATIENCE: Duration = Duration::from_millis(4);
 
@@ -67,6 +70,8 @@ struct Live {
     synced: bool,
     /// Access units in the transform: (time in 100 ns units, when pushed).
     pending: VecDeque<(i64, Instant)>,
+    /// Access units that wait for their turn to be decoded.
+    backlog: VecDeque<Pushed<AccessUnit>>,
     /// Where the next sound block starts, if the transform stamps none.
     sound_next: f64,
     clock: Arc<audio::Clock>,
@@ -107,6 +112,7 @@ impl Live {
             origin: None,
             synced: false,
             pending: VecDeque::new(),
+            backlog: VecDeque::new(),
             sound_next: 0.0,
             clock: job.clock.clone(),
         })
@@ -124,16 +130,24 @@ impl Live {
             self.follow_sound(sound);
             let queues = self.input.take(PATIENCE);
             if queues.discontinuity {
+                self.backlog.clear();
                 self.restart(pipe);
             }
             // Sound first: the first picture's facts say whether there is sound to play.
             for frame in queues.audio {
                 self.sound_frame(frame, sound.is_some());
             }
-            for unit in queues.video {
+            // Pictures are decoded only a little ahead of the clock. The app's jitter buffer
+            // (`target_delay`) waits here as access units, which cost far less than pictures.
+            self.backlog.extend(queues.video);
+            while pipe.lock().frames.len() < AHEAD {
+                let Some(unit) = self.backlog.pop_front() else { break };
                 self.video_unit(unit, pipe, job)?;
             }
-            if queues.closed && self.input.pushed() > 0 {
+            if queues.closed && !self.backlog.is_empty() {
+                // `take` no longer waits once the input is closed.
+                std::thread::sleep(PATIENCE);
+            } else if queues.closed && self.input.pushed() > 0 {
                 let generation = job.generation;
                 pipe.lock().ended = Some(generation);
                 (job.notify)();
