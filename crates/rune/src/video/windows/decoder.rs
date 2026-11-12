@@ -249,7 +249,7 @@ impl Decoder {
     fn select_sound(&mut self, on: bool, clock: &Arc<audio::Clock>) {
         let Some(sound) = self.facts.sound else { return };
         if on && self.output.is_none() {
-            match Output::open(sound, clock.clone()) {
+            match Output::open(sound, clock.clone(), audio::BUFFER) {
                 Ok(output) => self.output = Some(output),
                 Err(e) => eprintln!("rune: no sound for the clip: {e}"),
             }
