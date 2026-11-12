@@ -54,6 +54,10 @@ pub(crate) struct Native {
     /// (`RUNE_VIDEO_LOG`).
     opened: Option<Instant>,
     counts: Counts,
+    /// Live: the target delay the clock was last steered to, and whether the queue still grows
+    /// to a target raised since.
+    target_seen: Option<f64>,
+    refill: bool,
     /// Told of each picture that reaches the surface (`Player::set_picture_observer`).
     observer: Option<Arc<dyn Fn(f64, Instant) + Send + Sync>>,
 }
@@ -470,7 +474,7 @@ impl Native {
                 MediaSource::Live(live) => {
                     let input = live.input();
                     let held = input.newest_seconds().map_or(0.0, |newest| (newest - pts).max(0.0));
-                    (input.config.target_delay.as_secs_f64() - held).max(0.0)
+                    (input.target_seconds() - held).max(0.0)
                 }
                 _ => 0.0,
             };
@@ -484,11 +488,20 @@ impl Native {
         let MediaSource::Live(source) = &shared.source else { return };
         let Phase::Playing { clock } = self.phase else { return };
         let Some(newest) = source.input().newest_seconds() else { return };
-        let wanted = source.input().config.target_delay.as_secs_f64();
+        let wanted = source.input().target_seconds();
         let depth = newest - clock.position(target);
         self.counts.depth = depth;
+        // A raised target is reached by slowing the clock; a lowered one by the usual speedup.
+        match self.target_seen.replace(wanted) {
+            Some(was) if wanted > was => self.refill = true,
+            Some(was) if wanted < was => self.refill = false,
+            _ => {}
+        }
+        if self.refill && super::steer::refilled(depth, wanted) {
+            self.refill = false;
+        }
         let lead = vsync::period().as_secs_f64() / 2.0;
-        match super::steer::steer(depth, wanted, clock.rate) {
+        match super::steer::steer(depth, wanted, clock.rate, self.refill) {
             super::steer::Steer::Keep => {}
             super::steer::Steer::Rate(rate) => self.event(shared, c, Event::Rate { target, rate }),
             super::steer::Steer::Jump => {

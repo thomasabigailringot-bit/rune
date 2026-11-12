@@ -11,6 +11,8 @@ const SLOWDOWN: f64 = 0.03;
 const HARD: f64 = 1.0;
 /// Excess depth, in seconds, the clock ignores.
 const SLACK: f64 = 0.04;
+/// Slower by this much while the queue grows to a raised target.
+const REFILL: f64 = 0.05;
 /// A speed change smaller than this isn't worth re-anchoring the clock for.
 const STEP: f64 = 0.004;
 
@@ -25,14 +27,23 @@ pub(crate) enum Steer {
     Jump,
 }
 
-/// What the clock should do for a queue `depth` seconds deep, aiming at `target`, running at `rate`.
-pub(crate) fn steer(depth: f64, target: f64, rate: f64) -> Steer {
+/// Whether a queue that grows to a raised target has got there.
+pub(crate) fn refilled(depth: f64, target: f64) -> bool {
+    depth >= target - SLACK
+}
+
+/// What the clock should do for a queue `depth` seconds deep, aiming at `target`, running at
+/// `rate`. `refill`: the target was raised and the queue has not reached it yet, so a queue
+/// under the target is slowed down for, however full it is.
+pub(crate) fn steer(depth: f64, target: f64, rate: f64, refill: bool) -> Steer {
     let excess = depth - target;
     if excess > HARD {
         return Steer::Jump;
     }
     let wanted = if excess > SLACK {
         1.0 + ((excess - SLACK) * 0.5).min(MAX_SPEEDUP)
+    } else if refill {
+        1.0 - REFILL
     } else if depth < target * 0.4 {
         1.0 - SLOWDOWN
     } else {
@@ -99,36 +110,36 @@ mod tests {
 
     #[test]
     fn keeps_speed_near_the_target() {
-        assert_eq!(steer(0.1, 0.1, 1.0), Steer::Keep);
-        assert_eq!(steer(0.13, 0.1, 1.0), Steer::Keep);
+        assert_eq!(steer(0.1, 0.1, 1.0, false), Steer::Keep);
+        assert_eq!(steer(0.13, 0.1, 1.0, false), Steer::Keep);
     }
 
     #[test]
     fn speeds_up_for_a_backlog_and_caps() {
-        assert!(matches!(steer(0.3, 0.1, 1.0), Steer::Rate(r) if r > 1.0 && r < 1.1));
-        assert_eq!(steer(1.0, 0.1, 1.0), Steer::Rate(1.0 + MAX_SPEEDUP));
+        assert!(matches!(steer(0.3, 0.1, 1.0, false), Steer::Rate(r) if r > 1.0 && r < 1.1));
+        assert_eq!(steer(1.0, 0.1, 1.0, false), Steer::Rate(1.0 + MAX_SPEEDUP));
     }
 
     #[test]
     fn slows_down_for_a_thin_queue_and_recovers() {
-        assert_eq!(steer(0.02, 0.1, 1.0), Steer::Rate(1.0 - SLOWDOWN));
-        assert_eq!(steer(0.1, 0.1, 1.0 - SLOWDOWN), Steer::Rate(1.0));
+        assert_eq!(steer(0.02, 0.1, 1.0, false), Steer::Rate(1.0 - SLOWDOWN));
+        assert_eq!(steer(0.1, 0.1, 1.0 - SLOWDOWN, false), Steer::Rate(1.0));
     }
 
     #[test]
     fn returns_to_exactly_1x_at_the_target() {
-        assert_eq!(steer(0.1, 0.1, 1.002), Steer::Rate(1.0));
-        assert_eq!(steer(0.1, 0.1, 0.999), Steer::Rate(1.0));
+        assert_eq!(steer(0.1, 0.1, 1.002, false), Steer::Rate(1.0));
+        assert_eq!(steer(0.1, 0.1, 0.999, false), Steer::Rate(1.0));
     }
 
     #[test]
     fn jumps_when_too_far_behind() {
-        assert_eq!(steer(3.0, 0.1, 1.0), Steer::Jump);
+        assert_eq!(steer(3.0, 0.1, 1.0, false), Steer::Jump);
     }
 
     #[test]
     fn small_changes_keep_the_anchor() {
-        assert_eq!(steer(0.2, 0.1, 1.0 + (0.06 * 0.5)), Steer::Keep);
+        assert_eq!(steer(0.2, 0.1, 1.0 + (0.06 * 0.5), false), Steer::Keep);
     }
 
     /// 30 pictures a second from `from` for `seconds`, a keyframe every `gop` seconds.
@@ -181,5 +192,42 @@ mod tests {
         let units = stream(0.0, 20.0, 1.0);
         let cut = backlog_cut(units.iter().copied(), 0.08).unwrap();
         assert_eq!(backlog_cut(units[cut.drop..].iter().copied(), 0.08), None);
+    }
+
+    /// The window's loop on a live stream at 1x: every `dt` seconds the clock follows `rate`, the
+    /// target changes to `to` at the start, and the result is the time to converge.
+    fn retarget(mut depth: f64, to: f64) -> (f64, f64) {
+        let (dt, mut rate, mut t) = (0.05, 1.0, 0.0);
+        let mut refill = to > depth;
+        while t < 300.0 {
+            if refill && refilled(depth, to) {
+                refill = false;
+            }
+            match steer(depth, to, rate, refill) {
+                Steer::Keep => {}
+                Steer::Rate(r) => rate = r,
+                Steer::Jump => panic!("jumped at {t} s, depth {depth}"),
+            }
+            if rate == 1.0 && (depth - to).abs() <= SLACK {
+                return (t, depth);
+            }
+            depth += (1.0 - rate) * dt;
+            t += dt;
+        }
+        panic!("no convergence: depth {depth} for target {to}");
+    }
+
+    #[test]
+    fn a_raised_target_fills_by_slowing_down() {
+        assert_eq!(steer(0.5, 1.0, 1.0, true), Steer::Rate(1.0 - REFILL));
+        assert!(!refilled(0.5, 1.0) && refilled(0.99, 1.0));
+        let (secs, depth) = retarget(0.08, 0.5);
+        assert!(secs < 15.0 && depth >= 0.5 - SLACK, "{secs} {depth}");
+    }
+
+    #[test]
+    fn a_lowered_target_drains_by_speeding_up_without_a_jump() {
+        let (secs, depth) = retarget(0.5, 0.08);
+        assert!(secs < 20.0 && depth <= 0.08 + SLACK, "{secs} {depth}");
     }
 }

@@ -7,7 +7,8 @@
 //!
 //! The clock is made for live. It starts [`LiveConfig::target_delay`] behind the newest picture
 //! pushed, follows the sound device while sound plays, speeds up a little (the sound is resampled)
-//! when the queue grows past the target, and jumps forward when it is far behind.
+//! when the queue grows past the target, and jumps forward when it is far behind. The target can
+//! change while playing ([`LiveVideo::set_target_delay`]).
 //! [`LiveVideo::discontinuity`] starts it again at the next keyframe.
 
 use super::{MediaSource, Player};
@@ -35,6 +36,13 @@ impl Default for LiveConfig {
             audio: true,
         }
     }
+}
+
+/// The longest target delay: the queues hold that much plus a margin.
+const MAX_TARGET: Duration = Duration::from_secs(60);
+
+fn micros(delay: Duration) -> u64 {
+    delay.min(MAX_TARGET).as_micros() as u64
 }
 
 /// One H.264 access unit in Annex B form (start codes). A keyframe carries its SPS and PPS; a
@@ -84,6 +92,8 @@ pub(crate) struct LiveInput {
     pub config: LiveConfig,
     queues: Mutex<Queues>,
     ready: Condvar,
+    /// The delay the clock aims at, in microseconds (see [`LiveVideo::set_target_delay`]).
+    target: AtomicU64,
     /// The newest video time pushed, in ticks; `i64::MIN` before the first.
     newest: AtomicI64,
     /// The first time stamp the decoder saw, in ticks: where its seconds start.
@@ -96,6 +106,7 @@ impl LiveInput {
     fn new(config: LiveConfig) -> Self {
         Self {
             config,
+            target: AtomicU64::new(micros(config.target_delay)),
             queues: Mutex::default(),
             ready: Condvar::new(),
             newest: AtomicI64::new(i64::MIN),
@@ -115,7 +126,7 @@ impl LiveInput {
 
     /// The delay the clock aims at, in seconds.
     pub(crate) fn target_seconds(&self) -> f64 {
-        self.config.target_delay.as_secs_f64()
+        self.target.load(Ordering::Relaxed) as f64 / 1e6
     }
 
     /// The decoder's time zero, in ticks (None: not set yet).
@@ -243,8 +254,23 @@ impl LiveVideo {
         self.input.ready.notify_all();
     }
 
-    /// The configuration this video was made with.
+    /// The configuration this video was made with, with the delay it aims at now.
     pub fn config(&self) -> LiveConfig {
-        self.input.config
+        LiveConfig {
+            target_delay: self.target_delay(),
+            ..self.input.config
+        }
+    }
+
+    /// How far behind the newest picture pushed the clock aims to run now.
+    pub fn target_delay(&self) -> Duration {
+        Duration::from_micros(self.input.target.load(Ordering::Relaxed))
+    }
+
+    /// Changes the jitter buffer of a playing video (at most 60 s). A larger delay slows the clock
+    /// a little until the queue holds it; a smaller one speeds it up until the queue shrinks to
+    /// it. Only a change of more than a second beyond the target jumps, as for any backlog.
+    pub fn set_target_delay(&self, delay: Duration) {
+        self.input.target.store(micros(delay), Ordering::Relaxed);
     }
 }
