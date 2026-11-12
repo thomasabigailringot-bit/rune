@@ -34,7 +34,10 @@ pub(crate) fn steer(depth: f64, target: f64, rate: f64) -> Steer {
     } else {
         1.0
     };
-    if (wanted - rate).abs() >= STEP {
+    // Back at the target the clock returns to exactly 1x: a small leftover would drain the
+    // queue, and the sound with it, until the slowdown kicked in.
+    let settle = wanted == 1.0 && rate != 1.0;
+    if settle || (wanted - rate).abs() >= STEP {
         Steer::Rate(wanted)
     } else {
         Steer::Keep
@@ -61,6 +64,12 @@ mod tests {
     fn slows_down_for_a_thin_queue_and_recovers() {
         assert_eq!(steer(0.02, 0.1, 1.0), Steer::Rate(1.0 - SLOWDOWN));
         assert_eq!(steer(0.1, 0.1, 1.0 - SLOWDOWN), Steer::Rate(1.0));
+    }
+
+    #[test]
+    fn returns_to_exactly_1x_at_the_target() {
+        assert_eq!(steer(0.1, 0.1, 1.002), Steer::Rate(1.0));
+        assert_eq!(steer(0.1, 0.1, 0.999), Steer::Rate(1.0));
     }
 
     #[test]
