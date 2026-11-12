@@ -291,8 +291,12 @@ impl Live {
                     log!("live: {:.2} s behind, jumping to {wanted:.2} s{}", newest - clock.position(now), if hidden { " (undrawn)" } else { "" });
                 }
                 let to = newest - wanted;
-                self.clock.update(|a| Anchor { at: now, pos: to, rate: a.rate });
                 self.skip(to, pipe);
+                // The clock stops, and the first picture at `to` starts it again (the UI when the
+                // window draws, `Follower::hidden` when not). Running on to `to` with nothing
+                // decoded there yet would be a stall. A start counts as undrawn until its first
+                // picture, which is why the clock cannot be moved here.
+                self.clock.set(None);
             }
             steer::Life::Hold { at } => {
                 self.clock.set(None);
