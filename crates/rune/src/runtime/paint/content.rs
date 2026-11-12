@@ -87,8 +87,7 @@ impl<S: 'static> Runtime<S> {
             // An animated image wakes the window for its next frame only while drawn in a shown
             // window: off screen it isn't painted, so it asks for nothing.
             if let Some((_, Some(at))) = placed && self.surface_visible && self.time_scale > 0.0 {
-                let wake = self.clock + (at - now).max(0.0) / self.time_scale as f64;
-                if self.loop_wake.is_none_or(|w| wake < w.0) { self.loop_wake = Some((wake, at)); }
+                wake_for_frame(&mut self.loop_wake, self.clock + (at - now).max(0.0) / self.time_scale as f64, at);
             }
             if let Some((image, _)) = placed {
                 let [x, y, iw, ih] = image.rect.map(|v| v as f32);
@@ -396,7 +395,7 @@ impl<S: 'static> Runtime<S> {
             }
             let mut bare = Vec::new();
             crate::text::bare_icons(layout, &spec.cold.pills, s, d_origin, &mut bare);
-            for (k, at, px) in bare {
+            for (k, at, [box_w, px]) in bare {
                 let pill = &spec.cold.pills[k];
                 let Some(b) = pill.bare.as_deref() else { continue };
                 let at = [
@@ -404,16 +403,21 @@ impl<S: 'static> Runtime<S> {
                     rest_origin[1] + (at[1] - d_origin[1]) * tk + glide[1],
                 ];
                 let drawn = px * tk;
-                // An image fits the square, keeping its shape; a glyph takes the text's colour.
+                let box_w = box_w * tk;
+                // An image fits the box, keeping its shape; a glyph takes the text's colour.
                 if let Some(pixels) = &b.image
                     && let (w, h) = pixels.size()
                     && w > 0
                     && h > 0
                 {
                     let (w, h) = (w as f32, h as f32);
-                    let k = drawn / w.max(h);
-                    let rect = [at[0] + (drawn - w * k) * 0.5, at[1] + (drawn - h * k) * 0.5, w * k, h * k];
-                    if let Some(image) = self.images.place(pixels, [rect[2], rect[3]]) {
+                    let k = (box_w / w).min(drawn / h);
+                    let rect = [at[0] + (box_w - w * k) * 0.5, at[1] + (drawn - h * k) * 0.5, w * k, h * k];
+                    let placed = self.images.place_at(pixels, [rect[2], rect[3]], Some(now));
+                    if let Some((_, Some(at))) = placed && self.surface_visible && self.time_scale > 0.0 {
+                        wake_for_frame(&mut self.loop_wake, self.clock + (at - now).max(0.0) / self.time_scale as f64, at);
+                    }
+                    if let Some((image, _)) = placed {
                         self.instances.push(Instance {
                             rect,
                             radii: [(b.radius * s * tk).min(rect[2].min(rect[3]) * 0.5); 4],
@@ -629,6 +633,12 @@ impl<S: 'static> Runtime<S> {
 /// A misspelled word's marker: Chromium's red, on macOS a row of dots and elsewhere a wavy line.
 /// (Linear light: #FF3B30 on macOS, #FF0000 elsewhere.)
 const SPELLING: Color = if cfg!(target_os = "macos") { Color { r: 1.0, g: 0.0437, b: 0.0296, a: 1.0 } } else { Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 } };
+
+/// Asks for a frame at loop time `wake` (the image's frame due at `at`), unless the loop already
+/// wakes sooner.
+fn wake_for_frame(loop_wake: &mut Option<(f64, f64)>, wake: f64, at: f64) {
+    if loop_wake.is_none_or(|w| wake < w.0) { *loop_wake = Some((wake, at)); }
+}
 
 /// The spelling marker from device x `x0` to `x1`, its top at `y`, `k` device px a point: on
 /// macOS 3 pt dots every 4 pt, elsewhere Chromium's 1 pt line waving 2 pt down and back every 6 pt.

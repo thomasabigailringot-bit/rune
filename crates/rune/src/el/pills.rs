@@ -68,20 +68,22 @@ impl El {
             return self;
         }
         let at = t.cold.pills.partition_point(|p| p.start < start);
-        let InlineIcon { icon, image, size, gap, radius, color } = icon;
-        let bare = Some(Box::new(BareIcon { size, gap, radius, image }));
+        let InlineIcon { icon, image, size, width, gap, radius, color } = icon;
+        let bare = Some(Box::new(BareIcon { size, width: width.unwrap_or(size), gap, radius, image }));
         t.cold.pills.insert(at, PillChip { start, end, icon, bg: None, fg: color, bare });
         self
     }
 }
 
 /// An icon set inline in text by [`El::inline_icon`]: a glyph or an image, `size` points square
-/// (14 by default), `gap` points before the text after it (4).
+/// (14 by default) or `size` high and [`width`](Self::width) wide, `gap` points before the text
+/// after it (4).
 #[derive(Clone, Debug)]
 pub struct InlineIcon {
     icon: Option<&'static crate::Icon>,
     image: Option<crate::Pixels>,
     size: f32,
+    width: Option<f32>,
     gap: f32,
     radius: f32,
     color: Option<Color>,
@@ -90,15 +92,22 @@ pub struct InlineIcon {
 impl InlineIcon {
     /// `icon`, drawn in [`Self::color`] or the element's text colour.
     pub fn glyph(icon: &'static crate::Icon) -> Self {
-        Self { icon: Some(icon), image: None, size: 14.0, gap: 4.0, radius: 0.0, color: None }
+        Self { icon: Some(icon), image: None, size: 14.0, width: None, gap: 4.0, radius: 0.0, color: None }
     }
-    /// An image (decoded pixels, such as a site's favicon), scaled to fit the square.
+    /// An image (decoded pixels, such as a site's favicon), scaled to fit its box, keeping its
+    /// shape.
     pub fn image(pixels: crate::Pixels) -> Self {
-        Self { icon: None, image: Some(pixels), size: 14.0, gap: 4.0, radius: 0.0, color: None }
+        Self { icon: None, image: Some(pixels), size: 14.0, width: None, gap: 4.0, radius: 0.0, color: None }
     }
     /// Its side in points.
     pub fn size(mut self, points: f32) -> Self {
         self.size = if points.is_finite() { points.max(0.0) } else { 0.0 };
+        self
+    }
+    /// Its width in points, when the box is wider (or narrower) than it is high: a wide emote
+    /// sets `size` to its height and this to its width. The image is centred in the box.
+    pub fn width(mut self, points: f32) -> Self {
+        self.width = Some(if points.is_finite() { points.max(0.0) } else { 0.0 });
         self
     }
     /// Its room after it, before the text, in points.

@@ -582,7 +582,7 @@ impl TextSystem {
             .map(|(i, p)| {
                 let r = (p.start as usize).min(text.len())..(p.end as usize).min(text.len());
                 let (lead, trail) = match &p.bare {
-                    Some(b) => (b.size + b.gap, 0.0),
+                    Some(b) => (b.width + b.gap, 0.0),
                     None => (pm.lead(p.icon.is_some()), pm.trail()),
                 };
                 (i, r, (lead * scale).round() as u32, (trail * scale).round() as u32)

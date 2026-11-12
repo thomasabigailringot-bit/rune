@@ -85,10 +85,12 @@ pub(crate) struct PillChip {
     pub bare: Option<Box<BareIcon>>,
 }
 
-/// An inline icon's room and look in points (see [`InlineIcon`](crate::InlineIcon)).
+/// An inline icon's room and look in points (see [`InlineIcon`](crate::InlineIcon)): a box
+/// `width` wide and `size` high.
 #[derive(Clone, Debug)]
 pub(crate) struct BareIcon {
     pub size: f32,
+    pub width: f32,
     pub gap: f32,
     pub radius: f32,
     pub image: Option<crate::Pixels>,

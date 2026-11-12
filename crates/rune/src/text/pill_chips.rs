@@ -2,8 +2,8 @@
 use super::*;
 
 /// Each inline icon (a bare pill) in `layout` (device px, at `origin`): its pill's index, its
-/// square's top-left corner and its side in px, centred on the letters of the word after it.
-pub(crate) fn bare_icons(layout: &Layout<Ink>, pills: &[PillChip], scale: f32, origin: [f32; 2], out: &mut Vec<(usize, [f32; 2], f32)>) {
+/// box's top-left corner and its width and height in px, centred on the letters of the word after it.
+pub(crate) fn bare_icons(layout: &Layout<Ink>, pills: &[PillChip], scale: f32, origin: [f32; 2], out: &mut Vec<(usize, [f32; 2], [f32; 2])>) {
     if pills.iter().all(|p| p.bare.is_none()) {
         return;
     }
@@ -27,11 +27,12 @@ pub(crate) fn bare_icons(layout: &Layout<Ink>, pills: &[PillChip], scale: f32, o
                 }
             }
             let px = (bare.size * scale).round().max(1.0);
+            let wide = (bare.width * scale).round().max(1.0);
             if asc == 0.0 {
                 (asc, desc) = (px * 0.95, px * 0.25);
             }
             let y = origin[1] + m.baseline + (desc - asc) * 0.5 - px * 0.5;
-            out.push((i, [(origin[0] + b.x).round(), y.round()], px));
+            out.push((i, [(origin[0] + b.x).round(), y.round()], [wide, px]));
         }
     }
 }

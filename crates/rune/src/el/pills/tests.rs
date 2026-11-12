@@ -2,7 +2,7 @@ use crate::color::Color;
 use crate::el::{PillStyle, rich, text, text_input};
 use crate::text::{Span, TextSystem};
 use parley::Alignment;
-use crate::{TextEdit, TextStyle};
+use crate::{InlineIcon, Pixels, TextEdit, TextStyle};
 
 const INK: Color = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
 const CHIP: Color = Color { r: 0.0, g: 0.0, b: 1.0, a: 0.2 };
@@ -161,4 +161,24 @@ mod live {
         rt.frame(3.0 / 60.0);
         assert!(pilled(&rt).is_empty(), "a range the text no longer reaches is dropped");
     }
+}
+
+#[test]
+fn an_inline_icon_reserves_its_width_and_keeps_its_height() {
+    let pixels = Pixels::new();
+    pixels.set(2, 1, vec![255; 8]);
+    let mut ts = TextSystem::default();
+    let mut boxes = |icon: InlineIcon| {
+        let e = text("hi there").inline_icon(3, icon);
+        let spec = e.text.as_ref().unwrap();
+        let layout = ts.layout_for_spec(spec, 1.0, None, Alignment::Start);
+        let mut out = Vec::new();
+        crate::text::bare_icons(&layout, &spec.cold.pills, 1.0, [0.0, 0.0], &mut out);
+        (layout.full_width(), out)
+    };
+    let (square_w, square) = boxes(InlineIcon::image(pixels.clone()).size(20.0).gap(2.0));
+    let (wide_w, wide) = boxes(InlineIcon::image(pixels).size(20.0).width(36.0).gap(2.0));
+    assert_eq!(square[0].2, [20.0, 20.0]);
+    assert_eq!(wide[0].2, [36.0, 20.0]);
+    assert!((wide_w - square_w - 16.0).abs() < 0.5, "the paragraph reserves the extra 16 points: {square_w} vs {wide_w}");
 }
