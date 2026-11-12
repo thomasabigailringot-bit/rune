@@ -1,0 +1,1 @@
+- **Windows: `RUNE_NO_OCCLUSION=1` turns the occlusion tracker off.** A window that must keep decoding and playing sound while other windows cover it (a live video under test, say) is then never counted as covered. Unset, nothing changes.

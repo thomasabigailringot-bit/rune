@@ -47,6 +47,11 @@ impl Tracked {
     /// Watches `window`, telling `report` each time it becomes covered or uncovered. None when
     /// the tracker's thread couldn't start; the window then never counts as covered.
     pub(crate) fn new(window: &winit::window::Window, report: Report) -> Option<Self> {
+        // A test or a live player that must keep its sound and its decoder going while other
+        // windows cover it can ask not to be tracked.
+        if std::env::var_os("RUNE_NO_OCCLUSION").is_some() {
+            return None;
+        }
         let hwnd = super::hwnd(window)? as usize;
         let tracker = tracker()?;
         tracker.windows.lock().unwrap().push(Watched { hwnd, report, sight: Sight::Unknown });
