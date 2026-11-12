@@ -594,7 +594,9 @@ impl Native {
         let duration = c.duration.unwrap_or(0.0);
         let shown = self.shown.unwrap_or(clock.pos);
         if ended {
-            let end = if duration > 0.0 { (shown / duration).floor() * duration + duration } else { shown + frame };
+            // The last picture may start a frame past the duration (60 fps against an audio track
+            // that ends first): it still belongs to the loop it ends.
+            let end = if duration > 0.0 { ((shown - frame) / duration).floor().max(0.0) * duration + duration } else { shown + frame };
             if pos >= end.max(shown + frame) {
                 self.end(shared, c, shown, duration);
             }

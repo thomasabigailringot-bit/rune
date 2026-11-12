@@ -303,6 +303,7 @@ impl Decoder {
         let mut waiting_since = Instant::now();
         // Audio alone: the clip's end, until the clock passes it and the clip hears so.
         let mut end_due: Option<f64> = None;
+        let mut sound_only;
         loop {
             // Take the UI's asks, then wait for room in the queue and a free texture.
             {
@@ -337,7 +338,12 @@ impl Decoder {
                     let room = s.frames.len() < AHEAD || !self.video_open;
                     let texture = self.ring.as_ref().is_none_or(Ring::free);
                     let sound_full = self.output.as_ref().is_some_and(Output::full);
-                    if !ended && room && texture && !(sound_full && !self.video_open) {
+                    let wanted = room && texture && !(sound_full && !self.video_open);
+                    // The device needs sound further ahead of the picture on screen than the few
+                    // pictures the queue holds (50 ms at 60 fps): with no room for a picture, the
+                    // sound stream reads alone.
+                    sound_only = !wanted && self.audio_open && !sound_full;
+                    if !ended && (wanted || sound_only) {
                         break;
                     }
                     let touched = s.touched.unwrap_or(waiting_since);
@@ -363,7 +369,11 @@ impl Decoder {
                     waiting_since = waiting_since.max(touched);
                 }
             }
-            let read = mf::read(&self.reader, MF_SOURCE_READER_ANY_STREAM.0 as u32)?;
+            let stream = match self.audio {
+                Some(audio) if sound_only => audio,
+                _ => MF_SOURCE_READER_ANY_STREAM.0 as u32,
+            };
+            let read = mf::read(&self.reader, stream)?;
             if read.flags & MF_SOURCE_READERF_ERROR.0 != 0 {
                 return Err("the decoder stopped with an error".into());
             }

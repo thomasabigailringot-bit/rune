@@ -177,8 +177,9 @@ pub(super) fn step(phase: &mut Phase, event: Event) -> Effects<Effect> {
             Effects::none()
         }
         (P::Buffering { play, .. }, Event::Restart { to }) => {
+            // A clock the decoder started behind a window nobody draws stops with the old run.
             *phase = P::Buffering { at: to, play };
-            Effects::none()
+            Effects::one(Effect::Clock(None))
         }
         (P::Playing { .. }, Event::Restart { to }) => {
             *phase = P::Buffering { at: to, play: true };

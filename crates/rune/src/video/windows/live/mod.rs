@@ -51,6 +51,8 @@ const REST: Duration = Duration::from_millis(500);
 /// A clip's clock is started, held and restarted here once no frame has drawn it for this long;
 /// the frame that draws it does so otherwise (this thread then only steers its speed).
 const UNDRAWN: Duration = Duration::from_millis(100);
+/// Media a recording's clock needs queued past its restart before this thread starts it.
+const RESTART_LEAD: f64 = 1.0;
 /// The longest this thread decodes pictures before it looks at the sound again.
 const SLICE: Duration = Duration::from_millis(6);
 /// How long the thread waits for something to arrive before it looks at the pipe again.
@@ -270,10 +272,22 @@ impl Live {
     /// the queue runs dry until the target is queued again, and restarts it after a
     /// discontinuity. The UI takes the clock as it is when it draws again.
     fn follow(&mut self, pipe: &Pipe, idle: Duration, play: bool) {
+        let hidden = idle > UNDRAWN;
         if self.on_demand {
+            // A recording's clock starts at the first picture shown, and nothing shows behind a
+            // window nobody draws: after a restart there it starts here, where the restart
+            // landed, once media waits there. The frame that draws again takes it from there.
+            if hidden && play && self.clock.get().is_none() {
+                let ready = self.skip_until.zip(self.input.newest_seconds()).filter(|(at, newest)| newest - at >= RESTART_LEAD);
+                if let Some((at, _)) = ready {
+                    self.clock.set(Some(Anchor { at: Instant::now(), pos: at, rate: 1.0 }));
+                    if logging() {
+                        log!("live: recording's clock starts at {at:.2} s while undrawn");
+                    }
+                }
+            }
             return;
         }
-        let hidden = idle > UNDRAWN;
         if self.reanchor {
             self.rejoin(pipe, hidden);
             if self.reanchor {
