@@ -114,6 +114,8 @@ pub(crate) struct LiveInput {
     pushed: AtomicU64,
     /// The recording's length in microseconds; `u64::MAX` when not known.
     duration: AtomicU64,
+    /// Where the latest run of a recording starts, in microseconds ([`LiveVideo::restart`]).
+    run_at: AtomicU64,
 }
 
 impl LiveInput {
@@ -128,6 +130,7 @@ impl LiveInput {
             origin: AtomicI64::new(if config.on_demand { 0 } else { i64::MIN }),
             pushed: AtomicU64::new(0),
             duration: AtomicU64::new(u64::MAX),
+            run_at: AtomicU64::new(0),
         }
     }
 
@@ -290,6 +293,7 @@ impl LiveVideo {
             return;
         }
         let seconds = at.as_secs_f64();
+        self.input.run_at.store(at.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         let mut q = self.input.queues.lock().unwrap();
         q.video.clear();
         q.audio.clear();
@@ -309,9 +313,12 @@ impl LiveVideo {
     }
 
     /// On-demand: media pushed and not yet shown (the newest unit pushed minus [`Player::time`]),
-    /// so the app can stop reading while enough is queued. Pausing does not drain it.
+    /// so the app can stop reading while enough is queued. Pausing does not drain it. The position
+    /// is never before the start of the latest run: until a picture of that run shows, the time
+    /// can still be that of a picture of the run before it.
     pub fn buffered(&self) -> Duration {
-        Duration::from_secs_f64(steer::buffered(self.input.newest_seconds(), self.player.time()))
+        let run_at = self.input.run_at.load(Ordering::Relaxed) as f64 / 1e6;
+        Duration::from_secs_f64(steer::buffered(self.input.newest_seconds(), self.player.time().max(run_at)))
     }
 
     /// The configuration this video was made with, with the delay it aims at now.

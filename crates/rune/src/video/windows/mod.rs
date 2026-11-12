@@ -251,7 +251,7 @@ pub(super) fn pull(shared: &Arc<Shared>, surface: &NativeSurface, target: Instan
     let lead = vsync::period().as_secs_f64() / 2.0;
     if let (Phase::Playing { .. }, Some(gap), Some(at)) = (native.phase, gap, native.shown)
         && gap > RESUME_GAP
-        && !native.sounding(&c)
+        && !native.sounding(shared, &c)
         && !shared.source.is_live()
     {
         native.event(shared, &c, Event::Resumed { target, at, lead });
@@ -323,8 +323,11 @@ impl Native {
     }
 
     /// Sound is playing: the clip's clock runs on whether or not it's drawn.
-    fn sounding(&self, c: &Control) -> bool {
-        !c.muted && self.facts.is_some_and(|f| f.sound.is_some())
+    /// A fed video has sound before its facts: they come with its first picture, and its first sound
+    /// can arrive before that (a whole segment at once). The decoder drops sound that is not wanted.
+    fn sounding(&self, shared: &Shared, c: &Control) -> bool {
+        let fed = matches!(&shared.source, MediaSource::Live(live) if live.input().config.audio);
+        !c.muted && (fed || self.facts.is_some_and(|f| f.sound.is_some()))
     }
 
     /// Folds the decoder's news and the handle's intent into the phase.
@@ -383,7 +386,7 @@ impl Native {
             self.rate = c.rate;
             self.event(shared, c, Event::Rate { target, rate: f64::from(c.rate) });
         }
-        let sound = self.sounding(c).then_some(c.volume);
+        let sound = self.sounding(shared, c).then_some(c.volume);
         if let Some(pipe) = &self.pipe {
             let mut inbox = pipe.lock();
             if inbox.looping != c.looping || inbox.sound != sound || inbox.play != c.playing() {

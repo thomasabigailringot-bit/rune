@@ -183,7 +183,7 @@ impl Live {
             }
             // Sound first: the first picture's facts say whether there is sound to play.
             for frame in queues.audio {
-                self.sound_frame(frame, sound.is_some());
+                self.sound_frame(frame, sound);
             }
             self.follow(pipe, idle, play);
             let resting = self.rest(pipe, idle);
@@ -451,8 +451,8 @@ impl Live {
         }
     }
 
-    fn sound_frame(&mut self, frame: Pushed<AacFrame>, wanted: bool) {
-        if !wanted {
+    fn sound_frame(&mut self, frame: Pushed<AacFrame>, sound: Option<f32>) {
+        if sound.is_none() {
             return;
         }
         if self.audio.is_none() {
@@ -468,6 +468,9 @@ impl Live {
                     return;
                 }
             }
+            // The output opens now, not on the next pass: a burst (a whole segment at once) holds
+            // seconds of sound, and what this pass decodes would go to no output and be lost.
+            self.follow_sound(sound);
         }
         let time = hundred_ns(frame.item.pts);
         let seconds = self.seconds(frame.item.pts);

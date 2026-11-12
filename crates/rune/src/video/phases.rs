@@ -316,10 +316,13 @@ pub(super) fn step(c: &mut Control, event: Event) -> Effects<Effect> {
 
 fn opened(c: &mut Control, meta: Meta) {
     c.meta = Some(meta);
-    c.duration = Some(meta.duration);
+    // A length of 0 is no length: a fed video reports it, and clamping its time to 0 would zero its clock.
+    c.duration = Some(meta.duration).filter(|d| *d > 0.0);
     c.size = meta.size;
-    c.time = c.time.min(meta.duration);
-    c.seek = c.seek.map(|t| t.min(meta.duration));
+    if let Some(length) = c.duration {
+        c.time = c.time.min(length);
+        c.seek = c.seek.map(|t| t.min(length));
+    }
     c.generation += 1;
 }
 
