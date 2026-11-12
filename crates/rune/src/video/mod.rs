@@ -50,7 +50,6 @@ use unsupported as backend;
 mod windows;
 #[cfg(target_os = "windows")]
 use self::windows as backend;
-#[cfg(any(target_os = "windows", test))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod steer;
 mod waker;
