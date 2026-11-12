@@ -75,6 +75,8 @@ struct Live {
     backlog: VecDeque<Pushed<AccessUnit>>,
     /// After a jump: pictures before this time (seconds) are decoded but not kept.
     skip_until: Option<f64>,
+    /// The sound output failed to open (logged once).
+    sound_failed: bool,
     /// Where the next sound block starts, if the transform stamps none.
     sound_next: f64,
     clock: Arc<audio::Clock>,
@@ -117,6 +119,7 @@ impl Live {
             pending: VecDeque::new(),
             backlog: VecDeque::new(),
             skip_until: None,
+            sound_failed: false,
             sound_next: 0.0,
             clock: job.clock.clone(),
         })
@@ -224,7 +227,12 @@ impl Live {
             (Some(_), None, Some(audio)) => {
                 match Output::open(audio.sound, self.clock(), audio::BUFFER_LIVE) {
                     Ok(output) => self.output = Some(output),
-                    Err(e) => eprintln!("rune: no sound for the live video: {e}"),
+                    Err(e) => {
+                        // Tried again on every pass: say it once.
+                        if logging() && !std::mem::replace(&mut self.sound_failed, true) {
+                            log!("live: no sound output: {e}");
+                        }
+                    }
                 }
             }
             (None, Some(_), _) => self.output = None,
@@ -275,7 +283,9 @@ impl Live {
             match aac::Audio::new(self.lib, header) {
                 Ok(audio) => self.audio = Some(audio),
                 Err(e) => {
-                    eprintln!("rune: no sound for the live video: {e}");
+                    if logging() {
+                        log!("live: no AAC decoder: {e}");
+                    }
                     return;
                 }
             }
