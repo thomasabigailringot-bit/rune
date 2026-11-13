@@ -140,6 +140,7 @@ pub use player_controls::PlayerChrome;
 pub use player_controls::PlayerControls;
 pub use player_controls::PlayerEvent;
 pub use player_controls::PlayerFacts;
+pub use player_controls::player_key;
 pub use popup_list::PopupItem;
 pub use popup_list::PopupList;
 pub use radio::RadioGroup;

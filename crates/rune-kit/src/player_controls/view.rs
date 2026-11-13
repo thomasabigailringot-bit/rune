@@ -162,7 +162,7 @@ impl<S: 'static> PlayerControls<S> {
         let w = wire;
         stage.on_wheel(move |s: &mut S, e, tx: &mut Tx| {
             let by = match e.dy {
-                dy if dy == 0.0 => return false,
+                0.0 => return false,
                 dy if e.precise => dy / 400.0,
                 dy => VOLUME_STEP.copysign(dy),
             };

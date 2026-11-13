@@ -110,6 +110,12 @@ selectable text so a selected command line looks like a selected field:
 `text(cmd).selectable(true).selection_color(k.selection())`. `rune-text--selectable-help` in the
 gallery shows both, with an icon button explained by `.help`.
 
+`PlayerControls::new(facts, &s.chrome, now).chrome(|s: &mut App| &mut s.chrome).on_action(..).build(&k, video)`
+puts web-style controls over an app's own video element: play, seek bar with a buffered fill and
+hover time, volume, rate, full screen, a centre flash, and bars that hide three seconds after the
+last activity while it plays. The app owns a `PlayerChrome`, tells the controls its `PlayerFacts`,
+executes each `PlayerAction`, and maps keys with `player_key`. See `examples/video-player`.
+
 Button (10 variants × 3 sizes × 5 states), IconButton, Switch (compact, standard), Checkbox,
 RadioGroup/RadioItem, TextInput, TextArea, TextField (older), Field, Select (inline and field
 triggers, grouped), Popover, Menu (compact and standard, checkbox/radio items, submenus,
