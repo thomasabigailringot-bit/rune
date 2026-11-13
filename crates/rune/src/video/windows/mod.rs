@@ -343,9 +343,12 @@ impl Native {
     /// Sound is playing: the clip's clock runs on whether or not it's drawn.
     /// A fed video has sound before its facts: they come with its first picture, and its first sound
     /// can arrive before that (a whole segment at once). The decoder drops sound that is not wanted.
+    /// A file asks for sound before its facts too: the decoder knows from the file whether it has
+    /// any, and an ask withdrawn until the facts arrive would deselect the audio stream just after
+    /// the open, so that it resumes where the reader stands and the first seconds stay silent.
     fn sounding(&self, shared: &Shared, c: &Control) -> bool {
         let fed = matches!(&shared.source, MediaSource::Live(live) if live.input().config.audio);
-        !c.muted && (fed || self.facts.is_some_and(|f| f.sound.is_some()))
+        !c.muted && (fed || self.facts.is_none_or(|f| f.sound.is_some()))
     }
 
     /// Folds the decoder's news and the handle's intent into the phase.
