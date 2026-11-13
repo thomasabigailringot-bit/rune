@@ -120,6 +120,40 @@ pub static STAR_FILLED: Icon = Icon {
     body: r#"<path d="M8 2.1L9.7 6.25L14.18 6.59L10.76 9.5L11.82 13.86L8 11.5L4.18 13.86L5.24 9.5L1.82 6.59L6.3 6.25Z" fill="currentColor" stroke="currentColor" stroke-linejoin="round"/>"#,
 };
 
+/// A play triangle. Not a `Glyphs` slot: `icon(&glyphs::PLAY, 16.0)`.
+pub static PLAY: Icon =
+    Icon { name: "kit-play", view: 16.0, body: r#"<path d="M4.5 2.75L13 8L4.5 13.25V2.75Z" fill="currentColor" stroke="currentColor" stroke-linejoin="round"/>"# };
+/// Two pause bars. Not a `Glyphs` slot: `icon(&glyphs::PAUSE, 16.0)`.
+pub static PAUSE: Icon = Icon {
+    name: "kit-pause",
+    view: 16.0,
+    body: r#"<rect x="3.5" y="2.5" width="3" height="11" rx="0.5" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="0.5" fill="currentColor"/>"#,
+};
+/// A speaker with sound waves. Not a `Glyphs` slot: `icon(&glyphs::VOLUME, 16.0)`.
+pub static VOLUME: Icon = Icon {
+    name: "kit-volume",
+    view: 16.0,
+    body: r#"<path d="M2 6H4.5L8 3V13L4.5 10H2V6Z" fill="currentColor" stroke="currentColor" stroke-linejoin="round"/><path d="M10.5 5.5Q12 8 10.5 10.5M12.5 3.5Q15.5 8 12.5 12.5" stroke="currentColor" stroke-linecap="round"/>"#,
+};
+/// A speaker crossed out. Not a `Glyphs` slot: `icon(&glyphs::VOLUME_OFF, 16.0)`.
+pub static VOLUME_OFF: Icon = Icon {
+    name: "kit-volume-off",
+    view: 16.0,
+    body: r#"<path d="M2 6H4.5L8 3V13L4.5 10H2V6Z" fill="currentColor" stroke="currentColor" stroke-linejoin="round"/><path d="M10.5 6L14.5 10M14.5 6L10.5 10" stroke="currentColor" stroke-linecap="round"/>"#,
+};
+/// Four corners pointing out. Not a `Glyphs` slot: `icon(&glyphs::FULL_SCREEN, 16.0)`.
+pub static FULL_SCREEN: Icon = Icon {
+    name: "kit-full-screen",
+    view: 16.0,
+    body: r#"<path d="M2.5 6V2.5H6M10 2.5H13.5V6M13.5 10V13.5H10M6 13.5H2.5V10" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+/// Four corners pointing in. Not a `Glyphs` slot: `icon(&glyphs::EXIT_FULL_SCREEN, 16.0)`.
+pub static EXIT_FULL_SCREEN: Icon = Icon {
+    name: "kit-exit-full-screen",
+    view: 16.0,
+    body: r#"<path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10H13.5M2.5 10H6V13.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 const PAGE: &str = r#"<path d="M3.5 1.5H9.5L12.5 4.5V14.5H3.5V1.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M9.5 1.5V4.5H12.5" stroke="currentColor" stroke-linejoin="round"/>"#;
 
 /// A closed folder (file trees).
