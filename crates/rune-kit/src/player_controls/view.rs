@@ -140,7 +140,11 @@ impl<S: 'static> PlayerControls<S> {
         }
         if self.shown {
             if let Some(top) = &self.top {
-                stage = stage.child(top_bar(k, top.clone()));
+                // The pointer over the top bar keeps the controls up, as over the bottom bar.
+                let w = wire.clone();
+                stage = stage.child(top_bar(k, top.clone()).on_hover_change(move |s: &mut S, over, tx: &mut Tx| {
+                    w.event(s, PlayerEvent::BarHover(over), tx);
+                }));
             }
             stage = stage.child(bottom_bar(k, &self, &wire));
         }
