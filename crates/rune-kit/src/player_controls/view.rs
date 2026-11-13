@@ -6,7 +6,8 @@ use std::rc::Rc;
 use rune::{Color, Cursor, Drag, El, Phase, Transition, Tx, col, el, icon, row, text};
 
 use super::logic::{
-    Flash, PlayerAction, PlayerChrome, PlayerEvent, PlayerFacts, VOLUME_STEP, clock_label, rate_label, step_rate,
+    Flash, PlayerAction, PlayerChrome, PlayerEvent, PlayerFacts, VOLUME_STEP, behind_label, clock_label, rate_label,
+    step_rate,
 };
 use crate::{Kit, glyphs};
 
@@ -33,6 +34,7 @@ pub struct PlayerControls<S> {
     top: Option<El>,
     trailing: Vec<El>,
     rates: Vec<f32>,
+    skip: Option<f64>,
 }
 
 /// How handlers reach the chrome and the app, shared by every handler of one stage.
@@ -86,6 +88,7 @@ impl<S: 'static> PlayerControls<S> {
             top: None,
             trailing: Vec::new(),
             rates: Vec::new(),
+            skip: None,
         }
     }
 
@@ -116,6 +119,13 @@ impl<S: 'static> PlayerControls<S> {
     /// The playback rates, ascending. A button shows the rate and a press goes to the next one.
     pub fn rates(mut self, rates: &[f32]) -> Self {
         self.rates = rates.to_vec();
+        self
+    }
+
+    /// Two buttons after play and pause that seek back and forward by `seconds`. Off by default.
+    /// They show when the video can seek. At the live edge the forward one is disabled.
+    pub fn skip(mut self, seconds: f64) -> Self {
+        self.skip = Some(seconds);
         self
     }
 
@@ -244,12 +254,33 @@ fn control<S: 'static>(
     glyph: &'static rune::Icon,
     action: PlayerAction,
 ) -> El {
+    control_if(k, wire, key, label, glyph, action, true)
+}
+
+/// A [`control`] that, when not `enabled`, is dimmed and sends nothing.
+fn control_if<S: 'static>(
+    k: &Kit,
+    wire: &Rc<Wire<S>>,
+    key: &str,
+    label: &str,
+    glyph: &'static rune::Icon,
+    action: PlayerAction,
+    enabled: bool,
+) -> El {
     let w = wire.clone();
     let e = el().key(key).role("button").label(label).help(label).size(BUTTON, BUTTON).center().radius(k.radius.md);
+    if !enabled {
+        return e.disabled(true).layer_opacity(0.4).child(icon(glyph, 20.0).color(Color::WHITE).a11y_hidden());
+    }
     e.hover(light(k, 0.14))
         .press(light(k, 0.24))
         .child(icon(glyph, 20.0).color(Color::WHITE).a11y_hidden())
         .on_press_tx(move |s: &mut S, tx: &mut Tx| w.act(s, action, tx))
+}
+
+/// `Back 15 seconds`, `Forward 1 second`.
+fn skip_label(direction: &str, seconds: f64) -> String {
+    format!("{direction} {seconds} {}", if seconds == 1.0 { "second" } else { "seconds" })
 }
 
 fn bottom_bar<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) -> El {
@@ -276,10 +307,19 @@ fn bottom_bar<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) ->
         .h(BUTTON + 4.0)
         .items_center()
         .gap(2.0)
-        .child(play)
+        .child(play);
+    if let Some(seconds) = c.skip.filter(|_| f.can_seek()) {
+        let (back, forward) = (skip_label("Back", seconds), skip_label("Forward", seconds));
+        let back = control(k, wire, "player-back", &back, &glyphs::SKIP_BACK, PlayerAction::SeekBy(-seconds));
+        let edge = f.at_live_edge();
+        let forward =
+            control_if(k, wire, "player-forward", &forward, &glyphs::SKIP_FORWARD, PlayerAction::SeekBy(seconds), !edge);
+        buttons = buttons.child(back).child(forward);
+    }
+    buttons = buttons
         .child(mute)
         .child(volume_slider(k, wire, level))
-        .child(time_label(k, c))
+        .child(time_label(k, c, wire))
         .child(el().grow(1.0));
     for e in &c.trailing {
         buttons = buttons.child(e.clone());
@@ -298,7 +338,7 @@ fn bottom_bar<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) ->
     let fill = [(0.0, scrim(k, 0.0)), (1.0, scrim(k, 0.7))];
     let mut bar = col().key("player-bar").pin(Some(0.0), None, Some(0.0), Some(0.0)).px(12.0).pb(6.0).pt(28.0);
     bar = bar.linear_gradient(std::f32::consts::PI, fill);
-    if !f.live {
+    if f.can_seek() {
         bar = bar.child(seek_bar(k, c, wire));
     }
     let w = wire.clone();
@@ -307,18 +347,15 @@ fn bottom_bar<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) ->
     }))
 }
 
-fn time_label<S: 'static>(k: &Kit, c: &PlayerControls<S>) -> El {
+fn time_label<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) -> El {
     let style = k.ty.ui_compact.features("'tnum' 1");
     let f = &c.facts;
     if f.live {
-        return row()
-            .key("player-time")
-            .label("Live")
-            .items_center()
-            .gap(6.0)
-            .px(8.0)
-            .child(el().size(8.0, 8.0).radius(4.0).fill(k.c.danger.icon))
-            .child(text("LIVE").font(style).color(Color::WHITE));
+        let live = live_mark(k, c, wire, style);
+        let (Some(d), true) = (f.duration, f.dvr && f.behind_live) else { return live };
+        let behind = format!("-{}", clock_label(d - c.scrub.unwrap_or(f.time)));
+        let behind = el().key("player-time").label(behind.clone()).child(text(behind).font(style).color(Color::WHITE));
+        return row().items_center().child(live).child(behind);
     }
     let now = c.scrub.unwrap_or(f.time);
     let label = match f.duration {
@@ -326,6 +363,32 @@ fn time_label<S: 'static>(k: &Kit, c: &PlayerControls<S>) -> El {
         None => clock_label(now),
     };
     el().key("player-time").label(label.clone()).px(8.0).child(text(label).font(style).color(Color::WHITE))
+}
+
+/// The LIVE control: a red dot at the live edge, a grey one when behind. With a past (`dvr`) it
+/// is a button that goes live. Without, it is a mark.
+fn live_mark<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>, style: rune::TextStyle) -> El {
+    let f = &c.facts;
+    let dot = if f.behind_live && f.dvr { light(k, 0.5) } else { k.c.danger.icon };
+    let e = row()
+        .key("player-live")
+        .items_center()
+        .gap(6.0)
+        .px(8.0)
+        .child(el().size(8.0, 8.0).radius(4.0).fill(dot))
+        .child(text("LIVE").font(style).color(Color::WHITE));
+    if !f.dvr {
+        return e.label("Live");
+    }
+    let behind = f.behind_live;
+    let e = e.role("button").label(if behind { "Go to live" } else { "Live" }).h(BUTTON).radius(k.radius.md);
+    if !behind {
+        return e;
+    }
+    let w = wire.clone();
+    e.hover(light(k, 0.14))
+        .press(light(k, 0.24))
+        .on_press_tx(move |s: &mut S, tx: &mut Tx| w.act(s, PlayerAction::GoLive, tx))
 }
 
 fn rate_button<S: 'static>(k: &Kit, wire: &Rc<Wire<S>>, rate: f32, rates: &[f32]) -> El {
@@ -406,7 +469,8 @@ fn seek_bar<S: 'static>(k: &Kit, c: &PlayerControls<S>, wire: &Rc<Wire<S>>) -> E
         seek = seek.child(place.child(el().w_frac(played as f32)).child(thumb));
     }
     if let (Some(h), Some(d)) = (c.hover, total) {
-        let label = text(clock_label(c.scrub.unwrap_or(h * d))).font(k.ty.small_medium.features("'tnum' 1")).color(Color::WHITE);
+        let t = c.scrub.unwrap_or(h * d);
+        let label = text(if f.live { behind_label(d, t) } else { clock_label(t) }).font(k.ty.small_medium.features("'tnum' 1")).color(Color::WHITE);
         let chip = el().px(6.0).py(2.0).radius(k.radius.sm).fill(scrim(k, 0.75)).child(label);
         // A zero-width column at the pointer centres the chip on it. Near an end it stays inside.
         let at = h.clamp(0.06, 0.94) as f32;

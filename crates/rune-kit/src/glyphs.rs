@@ -153,6 +153,18 @@ pub static EXIT_FULL_SCREEN: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10H13.5M2.5 10H6V13.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+/// An arrow circle turning counter-clockwise. Not a `Glyphs` slot: `icon(&glyphs::SKIP_BACK, 16.0)`.
+pub static SKIP_BACK: Icon = Icon {
+    name: "kit-skip-back",
+    view: 16.0,
+    body: r#"<path d="M5.25 3.24A5.5 5.5 0 1 0 8.48 2.52" stroke="currentColor" stroke-linecap="round"/><path d="M10.4 0.8L8.2 2.55L10.4 4.4" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+/// An arrow circle turning clockwise. Not a `Glyphs` slot: `icon(&glyphs::SKIP_FORWARD, 16.0)`.
+pub static SKIP_FORWARD: Icon = Icon {
+    name: "kit-skip-forward",
+    view: 16.0,
+    body: r#"<path d="M10.75 3.24A5.5 5.5 0 1 1 7.52 2.52" stroke="currentColor" stroke-linecap="round"/><path d="M5.6 0.8L7.8 2.55L5.6 4.4" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 
 const PAGE: &str = r#"<path d="M3.5 1.5H9.5L12.5 4.5V14.5H3.5V1.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M9.5 1.5V4.5H12.5" stroke="currentColor" stroke-linejoin="round"/>"#;
 

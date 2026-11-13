@@ -115,6 +115,9 @@ puts web-style controls over an app's own video element: play, seek bar with a b
 hover time, volume, rate, full screen, a centre flash, and bars that hide three seconds after the
 last activity while it plays. The app owns a `PlayerChrome`, tells the controls its `PlayerFacts`,
 executes each `PlayerAction`, and maps keys with `player_key`. See `examples/video-player`.
+A live stream that can go back in time (`live` and `dvr` in `PlayerFacts`) gets the seek bar, with
+times behind live (`-12:30`), and a LIVE button that sends `PlayerAction::GoLive` while
+`behind_live`. `.skip(15.0)` adds back and forward buttons that send `SeekBy`.
 
 Button (10 variants × 3 sizes × 5 states), IconButton, Switch (compact, standard), Checkbox,
 RadioGroup/RadioItem, TextInput, TextArea, TextField (older), Field, Select (inline and field

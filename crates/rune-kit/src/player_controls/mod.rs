@@ -1,5 +1,6 @@
 //! Web-style video player controls over any video element: a play button, a seek bar with a
-//! buffered fill and a hover time, volume, the playback rate, full screen, a centre flash for
+//! buffered fill and a hover time, volume, the playback rate, full screen, skip buttons, a live
+//! stream that can go back in time, a centre flash for
 //! what a key did, and controls that hide while the video plays.
 //!
 //! The pieces follow [`ToastStack`](crate::ToastStack)'s pattern:
@@ -22,7 +23,7 @@ mod logic;
 mod view;
 
 pub use logic::{
-    FLASH_SECS, Flash, HIDE_AFTER, PlayerAction, PlayerChrome, PlayerEvent, PlayerFacts, VOLUME_STEP, clock_label,
+    FLASH_SECS, Flash, HIDE_AFTER, LIVE_EDGE_SECS, PlayerAction, PlayerChrome, PlayerEvent, PlayerFacts, VOLUME_STEP, behind_label, clock_label,
     player_key, rate_label, step_rate,
 };
 pub use view::PlayerControls;

@@ -6,10 +6,15 @@ struct App {
     facts: PlayerFacts,
     now: f64,
     actions: Vec<PlayerAction>,
+    skip: Option<f64>,
 }
 
 fn view(s: &App, _: &mut Cx<App>) -> El {
-    PlayerControls::new(s.facts, &s.chrome, s.now)
+    let mut controls = PlayerControls::new(s.facts, &s.chrome, s.now);
+    if let Some(seconds) = s.skip {
+        controls = controls.skip(seconds);
+    }
+    controls
         .chrome(|s: &mut App| &mut s.chrome)
         .on_action(|s: &mut App, action, tx: &mut Tx| {
             s.now = tx.clock();
@@ -29,7 +34,7 @@ const SIZE: (f32, f32) = (800.0, 450.0);
 const VIDEO: (f32, f32) = (400.0, 150.0);
 
 fn app(facts: PlayerFacts) -> Runtime<App> {
-    let state = App { chrome: PlayerChrome::new(), facts, now: 0.0, actions: Vec::new() };
+    let state = App { chrome: PlayerChrome::new(), facts, now: 0.0, actions: Vec::new(), skip: None };
     let mut rt = Runtime::new(state, view, SIZE, Env::new(true, 1.0));
     rt.poll = Some(poll);
     rt.frame(0.0);
@@ -210,8 +215,107 @@ fn a_flash_follows_an_action_and_fades() {
 fn live_has_no_seek_bar_and_shows_the_mark() {
     let rt = app(PlayerFacts { live: true, playing: false, duration: None, ..PlayerFacts::default() });
     assert!(has(&rt, "player-bar") && !has(&rt, "player-seek"));
-    let time = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("player-time")).unwrap();
-    assert_eq!(time.label.as_deref(), Some("Live"));
+    let live = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("player-live")).unwrap();
+    assert_eq!(live.label.as_deref(), Some("Live"));
+    assert!(!has(&rt, "player-time") && !has(&rt, "player-back") && !has(&rt, "player-forward"));
+}
+
+fn dvr(behind: bool) -> PlayerFacts {
+    PlayerFacts {
+        live: true,
+        dvr: true,
+        behind_live: behind,
+        time: if behind { 150.0 } else { 900.0 },
+        duration: Some(900.0),
+        ..PlayerFacts::default()
+    }
+}
+
+fn press(rt: &mut Runtime<App>, key: &str) {
+    let (x, y) = rt.find(key).unwrap();
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.0);
+}
+
+fn info(rt: &Runtime<App>, key: &str) -> rune::ElementInfo {
+    rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key) && !e.exiting).unwrap()
+}
+
+#[test]
+fn dvr_live_has_a_seek_bar_and_a_live_button() {
+    let mut rt = app(dvr(true));
+    assert!(has(&rt, "player-seek") && has(&rt, "player-live"));
+    assert_eq!(info(&rt, "player-live").label.as_deref(), Some("Go to live"));
+    assert_eq!(info(&rt, "player-time").label.as_deref(), Some("-12:30"));
+    let [x, y, w, h] = rect(&rt, "player-seek").unwrap();
+    rt.pointer_move(x + w * 0.5, y + h / 2.0);
+    rt.frame(0.0);
+    run(&mut rt, 1.0);
+    assert!(rt.elements().into_iter().filter_map(|e| e.text).any(|t| t == "-7:30"), "behind live at the pointer");
+    rt.pointer_move(x + w, y + h / 2.0);
+    rt.frame(0.0);
+    run(&mut rt, 1.0);
+    assert!(rt.elements().into_iter().filter_map(|e| e.text).any(|t| t == "LIVE"));
+    let edge = app(dvr(false));
+    assert!(has(&edge, "player-seek") && has(&edge, "player-live") && !has(&edge, "player-time"));
+    assert_eq!(info(&edge, "player-live").label.as_deref(), Some("Live"));
+}
+
+#[test]
+fn pressing_live_when_behind_goes_live() {
+    let mut rt = app(dvr(true));
+    press(&mut rt, "player-live");
+    assert_eq!(rt.state.actions, [PlayerAction::GoLive]);
+}
+
+#[test]
+fn pressing_live_at_the_edge_sends_nothing() {
+    let mut rt = app(dvr(false));
+    press(&mut rt, "player-live");
+    assert!(!rt.state.actions.contains(&PlayerAction::GoLive), "{:?}", rt.state.actions);
+}
+
+fn skipping(facts: PlayerFacts) -> Runtime<App> {
+    let mut rt = app(facts);
+    rt.update(|s, _| s.skip = Some(15.0));
+    run(&mut rt, 0.5);
+    rt
+}
+
+#[test]
+fn skip_buttons_seek_by_the_option() {
+    let mut rt = skipping(dvr(true));
+    assert_eq!(info(&rt, "player-back").label.as_deref(), Some("Back 15 seconds"));
+    assert_eq!(info(&rt, "player-forward").label.as_deref(), Some("Forward 15 seconds"));
+    press(&mut rt, "player-back");
+    press(&mut rt, "player-forward");
+    assert_eq!(rt.state.actions, [PlayerAction::SeekBy(-15.0), PlayerAction::SeekBy(15.0)]);
+}
+
+#[test]
+fn forward_is_disabled_at_the_live_edge() {
+    let mut rt = skipping(dvr(false));
+    assert!(has(&rt, "player-back") && has(&rt, "player-forward"));
+    press(&mut rt, "player-forward");
+    assert!(rt.state.actions.is_empty(), "{:?}", rt.state.actions);
+    press(&mut rt, "player-back");
+    assert_eq!(rt.state.actions, [PlayerAction::SeekBy(-15.0)]);
+}
+
+#[test]
+fn live_without_a_past_has_no_skip_buttons() {
+    let rt = skipping(PlayerFacts { live: true, ..PlayerFacts::default() });
+    assert!(!has(&rt, "player-seek") && !has(&rt, "player-back") && !has(&rt, "player-forward"));
+    assert!(has(&rt, "player-live"));
+}
+
+#[test]
+fn a_recording_with_skip_has_both_buttons_and_none_without() {
+    let rt = skipping(paused());
+    assert!(has(&rt, "player-back") && has(&rt, "player-forward"));
+    let rt = app(paused());
+    assert!(!has(&rt, "player-back") && !has(&rt, "player-forward"));
 }
 
 #[test]

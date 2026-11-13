@@ -58,6 +58,9 @@ fn facts(s: &Viewer) -> PlayerFacts {
         volume: c.volume(),
         muted: c.muted(),
         full_screen: s.full_screen,
+        live: false,
+        dvr: false,
+        behind_live: false,
         rate: c.rate(),
         ..PlayerFacts::default()
     }
@@ -95,6 +98,8 @@ fn execute(s: &mut Viewer, action: PlayerAction, tx: &mut Tx) {
             tx.toggle_full_screen();
         }
         PlayerAction::Rate(r) => clip.set_rate(r),
+        // The example plays recordings: there is no live edge.
+        PlayerAction::GoLive => {}
     }
 }
 

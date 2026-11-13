@@ -8,6 +8,8 @@ use rune::{Key, KeyEvent};
 pub const HIDE_AFTER: f64 = 3.0;
 /// Seconds a centre flash (Play, Pause, a volume level) stays up.
 pub const FLASH_SECS: f64 = 0.5;
+/// Seconds from the end of a live stream with a past that still count as live.
+pub const LIVE_EDGE_SECS: f64 = 3.0;
 /// How much one volume key press or wheel notch changes the volume.
 pub const VOLUME_STEP: f32 = 0.05;
 
@@ -24,9 +26,27 @@ pub struct PlayerFacts {
     pub volume: f32,
     pub muted: bool,
     pub full_screen: bool,
-    /// A live stream: no seek bar, no time, a LIVE mark.
+    /// A live stream: a LIVE mark, and no seek bar or time unless `dvr` is set.
     pub live: bool,
+    /// A live stream with a past that can be shown. Only meaningful when `live`. Then `time` is
+    /// the seconds since the stream began of the picture, and `duration` is the live edge in the
+    /// same seconds.
+    pub dvr: bool,
+    /// The picture is behind the live edge.
+    pub behind_live: bool,
     pub rate: f32,
+}
+
+impl PlayerFacts {
+    /// Whether the video can seek: a recording, or a live stream with a past (`dvr`).
+    pub fn can_seek(&self) -> bool {
+        !self.live || self.dvr
+    }
+
+    /// Whether the picture is at the live edge of a live stream.
+    pub fn at_live_edge(&self) -> bool {
+        self.live && !self.behind_live
+    }
 }
 
 impl Default for PlayerFacts {
@@ -40,6 +60,8 @@ impl Default for PlayerFacts {
             muted: false,
             full_screen: false,
             live: false,
+            dvr: false,
+            behind_live: false,
             rate: 1.0,
         }
     }
@@ -60,6 +82,8 @@ pub enum PlayerAction {
     ToggleMute,
     ToggleFullScreen,
     Rate(f32),
+    /// Go to the live edge of a live stream.
+    GoLive,
 }
 
 /// The short feedback in the middle of the video after an action.
@@ -71,6 +95,7 @@ pub enum Flash {
     Muted,
     SeekBy(f64),
     Rate(f32),
+    Live,
 }
 
 impl Flash {
@@ -80,6 +105,7 @@ impl Flash {
             Flash::Volume(v) => Some(format!("{} %", (v.clamp(0.0, 1.0) * 100.0).round() as i32)),
             Flash::SeekBy(s) => Some(format!("{}{} s", if s < 0.0 { "-" } else { "+" }, s.abs().round() as i64)),
             Flash::Rate(r) => Some(rate_label(r)),
+            Flash::Live => Some("LIVE".to_string()),
             Flash::Play | Flash::Pause | Flash::Muted => None,
         }
     }
@@ -90,6 +116,13 @@ pub fn clock_label(seconds: f64) -> String {
     let total = if seconds.is_finite() && seconds > 0.0 { seconds as u64 } else { 0 };
     let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// How far behind the live edge `at` is, as `-12:30`. `LIVE` when within [`LIVE_EDGE_SECS`] of
+/// `edge`.
+pub fn behind_label(edge: f64, at: f64) -> String {
+    let behind = edge - at;
+    if behind < LIVE_EDGE_SECS { "LIVE".to_string() } else { format!("-{}", clock_label(behind)) }
 }
 
 /// `1x`, `1.5x`, `0.25x`.
@@ -111,20 +144,24 @@ pub fn step_rate(rates: &[f32], current: f32, forward: bool, wrap: bool) -> Opti
 }
 
 /// The web player's keys. `None` when the key means nothing here, or the action cannot apply:
-/// seek keys do nothing on a live stream, and the tenth, Home and End keys need a duration.
+/// seek keys do nothing on a live stream without a past (`dvr`), and the tenth keys never apply to
+/// a live stream. The tenth and End keys need a duration. On a live stream with a past, End goes
+/// live, and the forward keys do nothing at the live edge.
 pub fn player_key(event: &KeyEvent, facts: &PlayerFacts, rates: &[f32]) -> Option<PlayerAction> {
     use PlayerAction::*;
     let m = event.mods;
     if m.ctrl || m.cmd || m.alt {
         return None;
     }
-    let seek = |a: PlayerAction| (!facts.live).then_some(a);
+    let seek = |a: PlayerAction| facts.can_seek().then_some(a);
+    let forward = |a: PlayerAction| (facts.can_seek() && !facts.at_live_edge()).then_some(a);
     match &event.key {
         Key::Left => seek(SeekBy(-5.0)),
-        Key::Right => seek(SeekBy(5.0)),
+        Key::Right => forward(SeekBy(5.0)),
         Key::Up => Some(VolumeBy(VOLUME_STEP)),
         Key::Down => Some(VolumeBy(-VOLUME_STEP)),
         Key::Home => seek(Seek(0.0)),
+        Key::End if facts.live => facts.dvr.then_some(GoLive),
         Key::End => facts.duration.and_then(|d| seek(Seek(d))),
         Key::Text(t) => {
             let mut chars = t.chars();
@@ -132,14 +169,14 @@ pub fn player_key(event: &KeyEvent, facts: &PlayerFacts, rates: &[f32]) -> Optio
             match c.to_ascii_lowercase() {
                 ' ' | 'k' => Some(TogglePlay),
                 'j' => seek(SeekBy(-10.0)),
-                'l' => seek(SeekBy(10.0)),
+                'l' => forward(SeekBy(10.0)),
                 'm' => Some(ToggleMute),
                 'f' => Some(ToggleFullScreen),
                 '<' => step_rate(rates, facts.rate, false, false).map(Rate),
                 '>' => step_rate(rates, facts.rate, true, false).map(Rate),
                 ',' if m.shift => step_rate(rates, facts.rate, false, false).map(Rate),
                 '.' if m.shift => step_rate(rates, facts.rate, true, false).map(Rate),
-                d @ '0'..='9' if !m.shift => {
+                d @ '0'..='9' if !m.shift && !facts.live => {
                     let tenth = f64::from(d as u8 - b'0');
                     facts.duration.and_then(|total| seek(Seek(total * tenth / 10.0)))
                 }
@@ -239,6 +276,7 @@ impl PlayerChrome {
             PlayerAction::ToggleMute => Flash::Muted,
             PlayerAction::SeekBy(s) => Flash::SeekBy(s),
             PlayerAction::Rate(r) => Flash::Rate(r),
+            PlayerAction::GoLive => Flash::Live,
             PlayerAction::Scrub(_) | PlayerAction::Seek(_) | PlayerAction::ToggleFullScreen => return None,
         })
     }
@@ -398,6 +436,49 @@ mod tests {
         }
         assert_eq!(player_key(&text("j"), &unknown, &RATES), Some(SeekBy(-10.0)));
         assert_eq!(player_key(&key(Key::Home), &unknown, &RATES), Some(Seek(0.0)));
+    }
+
+    #[test]
+    fn dvr_live_seeks_and_goes_live_by_key() {
+        use PlayerAction::*;
+        let behind = PlayerFacts { live: true, dvr: true, behind_live: true, duration: Some(900.0), time: 600.0, ..vod() };
+        assert_eq!(player_key(&text("j"), &behind, &RATES), Some(SeekBy(-10.0)));
+        assert_eq!(player_key(&text("l"), &behind, &RATES), Some(SeekBy(10.0)));
+        assert_eq!(player_key(&key(Key::Left), &behind, &RATES), Some(SeekBy(-5.0)));
+        assert_eq!(player_key(&key(Key::Right), &behind, &RATES), Some(SeekBy(5.0)));
+        assert_eq!(player_key(&key(Key::Home), &behind, &RATES), Some(Seek(0.0)));
+        assert_eq!(player_key(&key(Key::End), &behind, &RATES), Some(GoLive));
+        for d in '0'..='9' {
+            assert_eq!(player_key(&text(&d.to_string()), &behind, &RATES), None, "{d}");
+        }
+        let edge = PlayerFacts { behind_live: false, time: 900.0, ..behind };
+        assert_eq!(player_key(&text("l"), &edge, &RATES), None);
+        assert_eq!(player_key(&key(Key::Right), &edge, &RATES), None);
+        assert_eq!(player_key(&text("j"), &edge, &RATES), Some(SeekBy(-10.0)));
+        assert_eq!(player_key(&key(Key::Left), &edge, &RATES), Some(SeekBy(-5.0)));
+        assert_eq!(player_key(&key(Key::Home), &edge, &RATES), Some(Seek(0.0)));
+        assert_eq!(player_key(&key(Key::End), &edge, &RATES), Some(GoLive));
+    }
+
+    #[test]
+    fn live_without_a_past_has_no_go_live_key() {
+        let live = PlayerFacts { live: true, behind_live: true, ..vod() };
+        assert_eq!(player_key(&key(Key::End), &live, &RATES), None);
+        assert_eq!(player_key(&text("l"), &live, &RATES), None);
+        let recording = vod();
+        assert_eq!(player_key(&key(Key::End), &recording, &RATES), Some(PlayerAction::Seek(200.0)));
+    }
+
+    #[test]
+    fn behind_labels_and_the_live_flash() {
+        assert_eq!(behind_label(900.0, 150.0), "-12:30");
+        assert_eq!(behind_label(900.0, 897.5), "LIVE");
+        assert_eq!(behind_label(900.0, 896.0), "-0:04");
+        assert_eq!(Flash::Live.text().as_deref(), Some("LIVE"));
+        let f = PlayerFacts { live: true, dvr: true, ..vod() };
+        let mut c = PlayerChrome::new();
+        c.step(PlayerEvent::Acted(PlayerAction::GoLive), 1.0, &f);
+        assert_eq!(c.flash(1.0), Some(Flash::Live));
     }
 
     #[test]
